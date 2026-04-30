@@ -99,7 +99,27 @@ provider:
     headers:                                 # 선택. 기본 헤더
       X-Custom: "value"
     timeout: 30000                           # 선택. 타임아웃 (ms, 기본 30000)
+    credentialStore: file                    # 선택. file | keychain | env (기본 file)
+    retry:                                   # 선택. 재시도 정책 (기본 attempts: 1 = no retry)
+      attempts: 3
+      initialDelayMs: 200                    # exponential backoff 의 base
+      maxDelayMs: 5000                       # 재시도 delay 상한 (Retry-After 에도 적용)
+      retryOn: [429, 500, 502, 503, 504]     # 재시도 대상 status code
+      respectRetryAfter: true                # Retry-After 헤더 우선
+      jitter: full                           # full | equal | none
+      idempotent: auto                       # auto = GET/HEAD/PUT/DELETE 만 retry, true | false
 ```
+
+**Retry 동작**:
+- 응답 status 가 `retryOn` 에 포함되거나 fetch 자체가 실패 (네트워크 에러 / AbortError) 한 경우 재시도.
+- `idempotent: auto` (기본) 면 GET/HEAD/PUT/DELETE 만 재시도. POST/PATCH 는 명시적으로 `idempotent: true` 로만 활성화.
+- delay 계산: `min(maxDelayMs, initialDelayMs * 2^(attempt-1))` 에 jitter 적용. `Retry-After` 가 있으면 우선.
+- 401 은 retry 정책 미적용 (`auth-handlers` 의 JWT refresh 가 처리).
+
+**credentialStore 옵션**:
+- `file` (기본): `~/.<cli-name>/credentials/<ns>.json`, `chmod 0600`.
+- `keychain`: macOS Keychain (`security`) / Linux libsecret (`secret-tool`) / Windows Credential Manager (`cmdkey` + sidecar). OS CLI 미설치 시 `file` 로 graceful fallback.
+- `env`: `<CLI_UPPER>_<NS_UPPER>_TOKEN` 환경변수 (read-only, set/delete 시 throw). CI/CD 환경 권장.
 
 #### CLI Provider Config
 

@@ -12,7 +12,26 @@ export const manifestSchema = {
       additionalProperties: false,
       properties: {
         type: {type: 'string', enum: ['http', 'cli', 'python', 'js']},
-        config: {type: 'object', additionalProperties: true},
+        config: {
+          type: 'object',
+          additionalProperties: true,
+          properties: {
+            credentialStore: {type: 'string', enum: ['file', 'keychain', 'env'], default: 'file'},
+            retry: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                attempts: {type: 'integer', minimum: 1, default: 1},
+                initialDelayMs: {type: 'integer', minimum: 0, default: 200},
+                maxDelayMs: {type: 'integer', minimum: 0, default: 5000},
+                retryOn: {type: 'array', items: {type: 'integer'}, default: [429, 500, 502, 503, 504]},
+                respectRetryAfter: {type: 'boolean', default: true},
+                jitter: {type: 'string', enum: ['full', 'equal', 'none'], default: 'full'},
+                idempotent: {oneOf: [{type: 'boolean'}, {type: 'string', enum: ['auto']}], default: 'auto'},
+              },
+            },
+          },
+        },
       },
     },
     commands: {

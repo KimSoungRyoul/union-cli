@@ -70,12 +70,12 @@ npx my-cli api users create --name "John" --email "john@example.com" --json
 
 ## Provider 타입
 
-| Provider | 용도 | 통신 방식 |
-|----------|------|-----------|
-| **HTTP** | REST API 호출 | `fetch` |
-| **CLI** | 외부 바이너리 래핑 | `spawn` |
-| **Python** | Python 함수 호출 | JSON-RPC over stdio |
-| **JS** | Node.js 모듈 호출 | in-process ESM/CJS |
+| Provider | 용도 | 통신 방식 | 부가 기능 |
+|----------|------|-----------|-----------|
+| **HTTP** | REST API 호출 | `fetch` | retry (exponential backoff + jitter, Retry-After 존중) |
+| **CLI** | 외부 바이너리 래핑 | `spawn` | output 파서 (json/lines/csv/regex) |
+| **Python** | Python 함수 호출 | JSON-RPC over stdio | persistent/oneshot, venv |
+| **JS** | Node.js 모듈 호출 | in-process ESM/CJS | 모듈 캐싱 |
 
 ---
 
@@ -115,6 +115,10 @@ my-cli auth token <namespace>   # 토큰 출력 (파이프용)
 
 my-cli doctor                   # 시스템 + provider 상태 확인
 my-cli doctor --json
+
+my-cli plugin add <pkg-or-path> # npm 패키지/로컬 경로/git URL 플러그인 등록
+my-cli plugin list              # 등록된 플러그인 목록 (table/--json)
+my-cli plugin remove <name>     # 플러그인 제거 (--purge 로 로컬 파일 삭제)
 ```
 
 ```
@@ -138,6 +142,42 @@ my-cli api users list --format yaml      # YAML
 my-cli api users list --format csv       # CSV
 my-cli api users list --quiet            # 출력 없음 (exit code만)
 ```
+
+**색상**: TTY 환경에서 자동으로 ANSI 색상이 적용됩니다 (에러=빨강, 성공=초록, 경고=노랑, 헤더=bold). JSON/YAML 은 raw 보존(파이프/리다이렉트 안전).
+- `NO_COLOR=1` 또는 `--no-color`: 비활성화
+- `FORCE_COLOR=1`: 강제 활성화 (non-TTY 환경에도)
+- `TERM=dumb`: 자동 비활성화
+
+## Credential 저장소
+
+manifest 의 `provider.config.credentialStore` 로 저장 방식을 선택할 수 있습니다.
+
+| 값 | 동작 | 사용 사례 |
+|----|------|-----------|
+| `file` (기본) | `~/.<cli-name>/credentials/<ns>.json` (chmod 0600) | 기본/개인 |
+| `keychain` | macOS Keychain · Linux libsecret · Windows Credential Manager | 데스크톱 |
+| `env` | `<CLI>_<NS>_TOKEN` 환경변수 (read-only) | CI/CD |
+
+`keychain` 선택 시 OS CLI(`security` / `secret-tool` / `cmdkey`) 가 PATH 에 없으면 `file` 로 graceful fallback.
+
+## HTTP Retry
+
+manifest 의 `provider.config.retry` 로 자동 재시도 정책을 설정할 수 있습니다.
+
+```yaml
+provider:
+  type: http
+  config:
+    baseUrl: https://api.example.com
+    retry:
+      attempts: 3
+      retryOn: [429, 500, 502, 503, 504]
+      jitter: full              # full | equal | none
+      idempotent: auto          # auto = GET/HEAD/PUT/DELETE 만 retry
+```
+
+- 401 은 retry 정책 미적용 (auth-handlers 의 JWT refresh 가 처리)
+- `Retry-After` 헤더가 있으면 우선 (단 `maxDelayMs` cap)
 
 ---
 
