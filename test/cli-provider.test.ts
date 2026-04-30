@@ -1,6 +1,7 @@
-import {describe, it, expect} from 'vitest'
-import {buildCliArgs, sanitizeArg} from '../src/providers/cli/provider.js'
+import {describe, it, expect, vi, beforeEach, afterEach} from 'vitest'
+import {buildCliArgs, sanitizeArg, CLIProvider} from '../src/providers/cli/provider.js'
 import {spawnProcess} from '../src/providers/cli/process.js'
+import * as processModule from '../src/providers/cli/process.js'
 import {parseOutput} from '../src/providers/cli/output-parser.js'
 import type {CommandSpec, ExecutionInput} from '../src/core/types.js'
 
@@ -271,5 +272,155 @@ describe('spawnProcess error handling', () => {
     } finally {
       await fs.rm(tmpDir, {recursive: true, force: true})
     }
+  })
+})
+
+// ── CLIProvider error/stderr capture ──
+
+describe('CLIProvider.execute — stderr/stdout/exitCode/signal capture', () => {
+  type SpawnResult = {stdout: string; stderr: string; exitCode: number; signal?: string | null}
+  let spawnSpy: ReturnType<typeof vi.spyOn>
+
+  function mockSpawnResolve(result: SpawnResult): void {
+    spawnSpy.mockImplementation(async () => result as Awaited<ReturnType<typeof spawnProcess>>)
+  }
+
+  function mockSpawnReject(err: Error): void {
+    spawnSpy.mockImplementation(async () => {
+      throw err
+    })
+  }
+
+  beforeEach(() => {
+    spawnSpy = vi.spyOn(processModule, 'spawnProcess')
+  })
+
+  afterEach(() => {
+    spawnSpy.mockRestore()
+  })
+
+  function makeProvider(): CLIProvider {
+    return new CLIProvider({binary: 'kubectl'}, 'k8s')
+  }
+
+  // Case A: exit !== 0 + stderr "command not found"
+  // → error.message contains stderr; details has stderr/stdout/exitCode.
+  it('case A: exit !== 0 + stderr "command not found" → message=stderr, details 전부 보존', async () => {
+    mockSpawnResolve({stdout: '', stderr: 'kubectl: command not found\n', exitCode: 127})
+
+    const result = await makeProvider().execute(makeSpec(), makeInput())
+
+    expect(result.success).toBe(false)
+    expect(result.exitCode).toBe(127)
+    expect(result.error?.code).toBe('CLI_ERROR')
+    expect(result.error?.message).toBe('kubectl: command not found')
+    expect(result.error?.details).toMatchObject({
+      stderr: 'kubectl: command not found\n',
+      stdout: '',
+      exitCode: 127,
+    })
+    // signal should not be present when not provided by the spawn result.
+    expect((result.error?.details as Record<string, unknown>).signal).toBeUndefined()
+  })
+
+  // Case B: exit !== 0 + stderr 비어있고 stdout "warning..."
+  // → error.message uses stdout; details still preserves both.
+  it('case B: exit !== 0 + stderr 비어있고 stdout "warning..." → message=stdout', async () => {
+    mockSpawnResolve({stdout: 'warning: cluster unreachable\n', stderr: '', exitCode: 2})
+
+    const result = await makeProvider().execute(makeSpec(), makeInput())
+
+    expect(result.success).toBe(false)
+    expect(result.exitCode).toBe(2)
+    expect(result.error?.message).toBe('warning: cluster unreachable')
+    expect(result.error?.details).toMatchObject({
+      stderr: '',
+      stdout: 'warning: cluster unreachable\n',
+      exitCode: 2,
+    })
+  })
+
+  // Case C: 둘 다 비어있고 exit code 만 → error.message = "exit code N"
+  it('case C: stderr/stdout 둘 다 비어있고 exit code 만 있음 → message="exit code N"', async () => {
+    mockSpawnResolve({stdout: '', stderr: '', exitCode: 5})
+
+    const result = await makeProvider().execute(makeSpec(), makeInput())
+
+    expect(result.success).toBe(false)
+    expect(result.exitCode).toBe(5)
+    expect(result.error?.message).toBe('exit code 5')
+    expect(result.error?.details).toMatchObject({stderr: '', stdout: '', exitCode: 5})
+  })
+
+  // Case D: exit === 0 + stderr "Note: ..." → success=true, but details/notice 보존
+  it('case D: exit === 0 + stderr "Note: ..." → success=true, stderr 디버그 정보 부착', async () => {
+    mockSpawnResolve({stdout: '{"ok":true}', stderr: 'Note: deprecated flag used\n', exitCode: 0})
+
+    const result = await makeProvider().execute(makeSpec(), makeInput())
+
+    expect(result.success).toBe(true)
+    expect(result.exitCode).toBe(0)
+    expect(result.data).toEqual({ok: true})
+    // success path 에서도 stderr 가 비어있지 않으면 details/error notice 로 보존
+    expect(result.error).toBeDefined()
+    expect(result.error?.code).toBe('CLI_STDERR_NOTICE')
+    expect(result.error?.message).toBe('Note: deprecated flag used')
+    expect(result.error?.details).toMatchObject({
+      stderr: 'Note: deprecated flag used\n',
+      stdout: '{"ok":true}',
+      exitCode: 0,
+    })
+  })
+
+  it('case D-alt: exit === 0 + stderr 비어있음 → error 필드 없음 (clean success)', async () => {
+    mockSpawnResolve({stdout: '{"ok":true}', stderr: '', exitCode: 0})
+
+    const result = await makeProvider().execute(makeSpec(), makeInput())
+
+    expect(result.success).toBe(true)
+    expect(result.error).toBeUndefined()
+  })
+
+  // Case E: signal 로 종료 (SIGTERM/SIGKILL) → details.signal 포함
+  // process.ts 가 timeout 시 reject 하면서 "timed out ... killed" 메시지를 던진다.
+  // CLIProvider 는 catch 분기에서 signal 을 details.signal 로 surface.
+  it('case E: spawn 이 timeout-kill 로 reject → details.signal 보존', async () => {
+    mockSpawnReject(new Error('Process "kubectl" timed out after 30000ms and was killed.'))
+
+    const result = await makeProvider().execute(makeSpec(), makeInput())
+
+    expect(result.success).toBe(false)
+    expect(result.error?.code).toBe('CLI_EXECUTION_ERROR')
+    expect(result.error?.message).toMatch(/timed out .* killed/)
+    expect(result.error?.details).toMatchObject({signal: 'SIGKILL'})
+  })
+
+  it('case E-alt: spawnProcess 가 직접 signal 필드를 surface 하면 그 값을 details.signal 로 전달', async () => {
+    // Forward-compatibility: if process.ts ever exposes a `signal` field on
+    // ProcessResult, the provider should pass it through without re-mapping.
+    mockSpawnResolve({stdout: '', stderr: 'killed', exitCode: 1, signal: 'SIGTERM'})
+
+    const result = await makeProvider().execute(makeSpec(), makeInput())
+
+    expect(result.success).toBe(false)
+    expect(result.error?.details).toMatchObject({
+      stderr: 'killed',
+      stdout: '',
+      exitCode: 1,
+      signal: 'SIGTERM',
+    })
+  })
+
+  it('error.details 는 항상 stderr/stdout/exitCode 키를 포함한다 (스키마 안정성)', async () => {
+    mockSpawnResolve({stdout: 'out', stderr: 'err', exitCode: 9})
+
+    const result = await makeProvider().execute(makeSpec(), makeInput())
+
+    const details = result.error?.details as Record<string, unknown>
+    expect(details).toBeDefined()
+    expect(Object.keys(details)).toEqual(expect.arrayContaining(['stderr', 'stdout', 'exitCode']))
+    expect(details.stderr).toBe('err')
+    expect(details.stdout).toBe('out')
+    expect(details.exitCode).toBe(9)
   })
 })

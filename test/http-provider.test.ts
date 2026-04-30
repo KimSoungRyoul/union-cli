@@ -1,4 +1,6 @@
 import {describe, it, expect, vi} from 'vitest'
+import http from 'node:http'
+import type {AddressInfo} from 'node:net'
 import {
   buildPath,
   buildQueryParams,
@@ -6,10 +8,20 @@ import {
   buildHeaders,
   coerceBodyValue,
   resolveEndpointUrl,
+  normalizeRetryConfig,
+  computeBackoffMs,
+  parseRetryAfter,
+  isMethodRetryable,
+  fetchWithRetry,
+  paginate,
+  normalizePaginationConfig,
+  parseLinkHeaderNext,
+  getByPath,
+  HTTPProvider,
 } from '../src/providers/http/provider.js'
 import {applyAuth} from '../src/providers/http/auth-handlers.js'
 import {logger} from '../src/core/logger.js'
-import type {CommandSpec, AuthConfig} from '../src/core/types.js'
+import type {CommandSpec, AuthConfig, HttpProviderConfig} from '../src/core/types.js'
 
 function makeHttpSpec(overrides: Partial<CommandSpec> = {}): CommandSpec {
   return {
@@ -671,5 +683,942 @@ describe('applyAuth — 빈 토큰/credential은 Authorization 헤더를 생성�
     const result = applyAuth({}, {type: 'basic'}, {username: 'u', password: ''})
     expect(result.Authorization).toBeUndefined()
     errorSpy.mockRestore()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Retry policy
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('normalizeRetryConfig', () => {
+  it('빈/undefined 입력은 attempts=1 (기본 no-retry) 로 정규화된다', () => {
+    const cfg = normalizeRetryConfig(undefined)
+    expect(cfg.attempts).toBe(1)
+    expect(cfg.initialDelayMs).toBe(200)
+    expect(cfg.maxDelayMs).toBe(5000)
+    expect(cfg.respectRetryAfter).toBe(true)
+    expect(cfg.jitter).toBe('full')
+    expect(cfg.idempotent).toBe('auto')
+    expect([...cfg.retryOn]).toEqual([429, 500, 502, 503, 504])
+  })
+
+  it('전체 필드가 있는 경우 그대로 사용한다', () => {
+    const cfg = normalizeRetryConfig({
+      attempts: 5,
+      initialDelayMs: 100,
+      maxDelayMs: 1000,
+      retryOn: [503, 504],
+      respectRetryAfter: false,
+      jitter: 'none',
+      idempotent: true,
+    })
+    expect(cfg.attempts).toBe(5)
+    expect(cfg.initialDelayMs).toBe(100)
+    expect(cfg.maxDelayMs).toBe(1000)
+    expect([...cfg.retryOn].sort()).toEqual([503, 504])
+    expect(cfg.respectRetryAfter).toBe(false)
+    expect(cfg.jitter).toBe('none')
+    expect(cfg.idempotent).toBe(true)
+  })
+
+  it('attempts < 1 은 1로 보정된다', () => {
+    const cfg = normalizeRetryConfig({attempts: 0})
+    expect(cfg.attempts).toBe(1)
+  })
+
+  it('maxDelayMs < initialDelayMs 면 initialDelayMs 로 보정된다', () => {
+    const cfg = normalizeRetryConfig({initialDelayMs: 1000, maxDelayMs: 100})
+    expect(cfg.maxDelayMs).toBe(1000)
+  })
+
+  it('잘못된 jitter 값은 full 로 폴백한다', () => {
+    // 사용자가 'random' 같은 잘못된 enum 을 줬을 때 — 정규화는 안전한 기본값으로
+    const cfg = normalizeRetryConfig({jitter: 'random' as 'full'})
+    expect(cfg.jitter).toBe('full')
+  })
+
+  it('빈 retryOn 배열은 default 로 폴백한다', () => {
+    const cfg = normalizeRetryConfig({retryOn: []})
+    expect([...cfg.retryOn].sort((a, b) => a - b)).toEqual([429, 500, 502, 503, 504])
+  })
+})
+
+describe('parseRetryAfter', () => {
+  it('정수(seconds) 헤더를 ms 로 변환한다', () => {
+    expect(parseRetryAfter('1')).toBe(1000)
+    expect(parseRetryAfter('30')).toBe(30000)
+  })
+
+  it('HTTP-date 형식을 미래 시점까지의 ms 로 변환한다', () => {
+    const now = Date.now()
+    const future = new Date(now + 5000).toUTCString()
+    const result = parseRetryAfter(future, now)
+    // toUTCString 의 초 단위 반올림 때문에 약간의 오차 허용
+    expect(result).not.toBeNull()
+    expect(result!).toBeGreaterThanOrEqual(0)
+    expect(result!).toBeLessThanOrEqual(5000)
+  })
+
+  it('과거 시점은 0으로 clamp 된다', () => {
+    const now = Date.now()
+    const past = new Date(now - 5000).toUTCString()
+    expect(parseRetryAfter(past, now)).toBe(0)
+  })
+
+  it('null/빈/잘못된 값은 null 을 반환한다', () => {
+    expect(parseRetryAfter(null)).toBeNull()
+    expect(parseRetryAfter('')).toBeNull()
+    expect(parseRetryAfter('   ')).toBeNull()
+    expect(parseRetryAfter('not-a-date')).toBeNull()
+  })
+})
+
+describe('computeBackoffMs', () => {
+  it('jitter=none 이면 deterministic 한 exponential 값을 반환한다', () => {
+    const cfg = {initialDelayMs: 100, maxDelayMs: 5000, jitter: 'none' as const}
+    expect(computeBackoffMs(1, cfg)).toBe(100)
+    expect(computeBackoffMs(2, cfg)).toBe(200)
+    expect(computeBackoffMs(3, cfg)).toBe(400)
+    expect(computeBackoffMs(4, cfg)).toBe(800)
+  })
+
+  it('maxDelayMs 로 cap 된다', () => {
+    const cfg = {initialDelayMs: 100, maxDelayMs: 300, jitter: 'none' as const}
+    // 100 * 2^3 = 800 → 300 cap
+    expect(computeBackoffMs(4, cfg)).toBe(300)
+    expect(computeBackoffMs(10, cfg)).toBe(300)
+  })
+
+  it('jitter=full 이면 0 ~ delay 범위에서 무작위', () => {
+    const cfg = {initialDelayMs: 100, maxDelayMs: 5000, jitter: 'full' as const}
+    // rng=0 → 0, rng=0.999 → near 200
+    expect(computeBackoffMs(2, cfg, () => 0)).toBe(0)
+    expect(computeBackoffMs(2, cfg, () => 0.5)).toBe(100)
+  })
+
+  it('jitter=equal 이면 delay/2 ~ delay 범위', () => {
+    const cfg = {initialDelayMs: 100, maxDelayMs: 5000, jitter: 'equal' as const}
+    expect(computeBackoffMs(2, cfg, () => 0)).toBe(100)   // 200/2 + 0
+    expect(computeBackoffMs(2, cfg, () => 1)).toBe(200)   // 200/2 + 200/2
+  })
+})
+
+describe('isMethodRetryable', () => {
+  it('idempotent=false 면 모든 메서드를 거부한다', () => {
+    expect(isMethodRetryable('GET', false)).toBe(false)
+    expect(isMethodRetryable('POST', false)).toBe(false)
+  })
+
+  it('idempotent=true 면 모든 메서드를 허용한다', () => {
+    expect(isMethodRetryable('GET', true)).toBe(true)
+    expect(isMethodRetryable('POST', true)).toBe(true)
+  })
+
+  it('idempotent=auto 면 GET/HEAD/PUT/DELETE 만 허용한다', () => {
+    expect(isMethodRetryable('GET', 'auto')).toBe(true)
+    expect(isMethodRetryable('HEAD', 'auto')).toBe(true)
+    expect(isMethodRetryable('PUT', 'auto')).toBe(true)
+    expect(isMethodRetryable('DELETE', 'auto')).toBe(true)
+    expect(isMethodRetryable('POST', 'auto')).toBe(false)
+    expect(isMethodRetryable('PATCH', 'auto')).toBe(false)
+  })
+
+  it('소문자 메서드도 정확히 매칭한다', () => {
+    expect(isMethodRetryable('get', 'auto')).toBe(true)
+    expect(isMethodRetryable('post', 'auto')).toBe(false)
+  })
+})
+
+// ── fetchWithRetry: 시나리오 ──
+
+function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}): Response {
+  return new Response(typeof body === 'string' ? body : JSON.stringify(body), {
+    status,
+    headers: {'Content-Type': 'application/json', ...headers},
+  })
+}
+
+describe('fetchWithRetry', () => {
+  it('case 1: 503 → 200 — attempts=3, retryOn=[503] 이면 1회 재시도 후 성공한다', async () => {
+    const calls: number[] = []
+    const fakeFetch = vi.fn(async () => {
+      calls.push(Date.now())
+      if (calls.length === 1) return jsonResponse(503, {error: 'unavailable'})
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], jitter: 'none', initialDelayMs: 1})
+    const sleeps: number[] = []
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(res.status).toBe(200)
+    expect(fakeFetch).toHaveBeenCalledTimes(2)
+    expect(sleeps).toHaveLength(1)
+  })
+
+  it('case 2: 모든 attempts 가 503 이면 마지막 응답을 반환한다 (호출자가 HTTP_503 처리)', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(503, {error: 'down'}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], jitter: 'none', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(503)
+    expect(fakeFetch).toHaveBeenCalledTimes(3)
+  })
+
+  it('case 3: Retry-After (seconds) 헤더가 backoff 보다 우선 적용된다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) {
+        return jsonResponse(429, {error: 'too many'}, {'Retry-After': '2'})
+      }
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({
+      attempts: 3,
+      retryOn: [429],
+      jitter: 'none',
+      initialDelayMs: 50,
+      maxDelayMs: 5000,
+      respectRetryAfter: true,
+    })
+    const sleeps: number[] = []
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(res.status).toBe(200)
+    // Retry-After: 2 → 2000ms (initialDelayMs=50 인 backoff 와는 다름)
+    expect(sleeps).toEqual([2000])
+  })
+
+  it('case 3b: respectRetryAfter=false 면 헤더 무시하고 backoff 만 사용한다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) {
+        return jsonResponse(429, {error: 'too many'}, {'Retry-After': '5'})
+      }
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({
+      attempts: 3,
+      retryOn: [429],
+      jitter: 'none',
+      initialDelayMs: 100,
+      respectRetryAfter: false,
+    })
+    const sleeps: number[] = []
+    await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(sleeps).toEqual([100])
+  })
+
+  it('case 4: 네트워크 에러 (fetch reject) 도 retry 한다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) throw new Error('network failure')
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, jitter: 'none', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(200)
+    expect(fakeFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('case 4b: AbortError 도 동일하게 retry 된다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) {
+        const err = new Error('aborted')
+        err.name = 'AbortError'
+        throw err
+      }
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, jitter: 'none', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(200)
+  })
+
+  it('case 4c: 모든 attempts 가 네트워크 에러면 최종 throw 한다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      throw new Error('net down')
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, jitter: 'none', initialDelayMs: 1})
+    await expect(
+      fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+        fetchImpl: fakeFetch as unknown as typeof fetch,
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow('net down')
+    expect(fakeFetch).toHaveBeenCalledTimes(3)
+  })
+
+  it('case 5: idempotent=false 면 POST 도 retry 안 한다', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(503, {}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], idempotent: false, initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'POST', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(503)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('case 6a: idempotent=auto + GET 은 retry 한다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) return jsonResponse(503, {})
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], idempotent: 'auto', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(200)
+    expect(fakeFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('case 6b: idempotent=auto + POST 는 retry 안 한다', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(503, {}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], idempotent: 'auto', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'POST', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(503)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('case 7: retry config 미지정 시 default attempts=1 — 한 번만 호출하고 반환', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(503, {}))
+    const cfg = normalizeRetryConfig(undefined) // attempts=1
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(503)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('case 8: jitter=none + initialDelayMs=100 일 때 정확히 100, 200, 400 ms 슬립한다', async () => {
+    let attempts = 0
+    const fakeFetch = vi.fn(async () => {
+      attempts++
+      if (attempts < 4) return jsonResponse(503, {})
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({
+      attempts: 4,
+      retryOn: [503],
+      jitter: 'none',
+      initialDelayMs: 100,
+      maxDelayMs: 5000,
+    })
+    const sleeps: number[] = []
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(res.status).toBe(200)
+    // attempt 1 fail → backoff(1)=100, attempt 2 fail → backoff(2)=200, attempt 3 fail → backoff(3)=400
+    expect(sleeps).toEqual([100, 200, 400])
+  })
+
+  it('401 응답은 retry 정책 미적용 — 즉시 반환된다 (auth-handlers 영역)', async () => {
+    // retryOn 에 401 을 명시적으로 추가했더라도 retry 하지 않는다.
+    const fakeFetch = vi.fn(async () => jsonResponse(401, {error: 'unauthorized'}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [401, 503], jitter: 'none', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(401)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('retryOn 에 없는 status (예: 400) 는 즉시 반환', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(400, {error: 'bad request'}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(400)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('Retry-After 가 maxDelayMs 보다 크면 cap 된다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) {
+        return jsonResponse(429, {}, {'Retry-After': '100'}) // 100s = 100000ms
+      }
+      return jsonResponse(200, {})
+    })
+    const cfg = normalizeRetryConfig({
+      attempts: 3,
+      retryOn: [429],
+      jitter: 'none',
+      initialDelayMs: 50,
+      maxDelayMs: 1000,
+    })
+    const sleeps: number[] = []
+    await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(sleeps).toEqual([1000])
+  })
+})
+
+// ── Pagination — pure helpers ───────────────────────────────────────────────
+
+describe('getByPath', () => {
+  it('단순 키 추출', () => {
+    expect(getByPath({a: 1}, 'a')).toBe(1)
+  })
+  it('dot-path 로 nested 값 추출', () => {
+    expect(getByPath({a: {b: {c: 42}}}, 'a.b.c')).toBe(42)
+  })
+  it('중간 경로가 null 이면 undefined', () => {
+    expect(getByPath({a: null}, 'a.b')).toBeUndefined()
+  })
+  it('빈 path 는 root 그대로 반환', () => {
+    const o = {x: 1}
+    expect(getByPath(o, '')).toBe(o)
+  })
+  it('non-object 중간값에서 정지', () => {
+    expect(getByPath({a: 'str'}, 'a.b')).toBeUndefined()
+  })
+})
+
+describe('parseLinkHeaderNext', () => {
+  it('rel="next" URL 추출', () => {
+    const link = '<https://api.example.com/items?page=2>; rel="next", <https://api.example.com/items?page=10>; rel="last"'
+    expect(parseLinkHeaderNext(link)).toBe('https://api.example.com/items?page=2')
+  })
+  it('따옴표 없는 rel=next 도 인식', () => {
+    expect(parseLinkHeaderNext('<https://x/p2>; rel=next')).toBe('https://x/p2')
+  })
+  it('rel="next" 가 없으면 null', () => {
+    expect(parseLinkHeaderNext('<https://x/last>; rel="last"')).toBeNull()
+  })
+  it('null/undefined/빈 문자열은 null', () => {
+    expect(parseLinkHeaderNext(null)).toBeNull()
+    expect(parseLinkHeaderNext(undefined)).toBeNull()
+    expect(parseLinkHeaderNext('')).toBeNull()
+  })
+  it('rel 순서가 반대여도 next 를 찾는다', () => {
+    const link = '<https://x/p1>; rel="prev", <https://x/p2>; rel="next"'
+    expect(parseLinkHeaderNext(link)).toBe('https://x/p2')
+  })
+})
+
+describe('normalizePaginationConfig', () => {
+  it('cursor 스타일은 pageParam + nextPath 가 필요', () => {
+    expect(() => normalizePaginationConfig({style: 'cursor'})).toThrow(/pageParam/)
+    expect(() => normalizePaginationConfig({style: 'cursor', pageParam: 'cursor'})).toThrow(/nextPath/)
+  })
+  it('offset 스타일은 pageParam 이 필요', () => {
+    expect(() => normalizePaginationConfig({style: 'offset'})).toThrow(/pageParam/)
+  })
+  it('link-header 스타일은 추가 필드 없어도 정상', () => {
+    const cfg = normalizePaginationConfig({style: 'link-header'})
+    expect(cfg.style).toBe('link-header')
+    expect(cfg.maxPages).toBe(100) // 기본값
+  })
+  it('잘못된 style 은 에러', () => {
+    expect(() => normalizePaginationConfig({style: 'bogus'})).toThrow(/style/)
+  })
+  it('maxPages 가 양의 정수가 아니면 에러', () => {
+    expect(() => normalizePaginationConfig({style: 'link-header', maxPages: 0})).toThrow(/maxPages/)
+    expect(() => normalizePaginationConfig({style: 'link-header', maxPages: -1})).toThrow(/maxPages/)
+    expect(() => normalizePaginationConfig({style: 'link-header', maxPages: 1.5})).toThrow(/maxPages/)
+  })
+  it('perPage 도 양의 정수만 허용', () => {
+    expect(() => normalizePaginationConfig({style: 'link-header', perPage: 0})).toThrow(/perPage/)
+  })
+  it('빈 문자열 옵션은 undefined 로 정규화', () => {
+    const cfg = normalizePaginationConfig({
+      style: 'cursor', pageParam: 'cursor', nextPath: 'next', itemsPath: '',
+    })
+    expect(cfg.itemsPath).toBeUndefined()
+  })
+})
+
+// ── Pagination — paginate() with mock fetch ─────────────────────────────────
+
+/** mock fetch 가 받은 URL 들을 기록해 검증할 수 있게 한다. */
+function makeMockFetch(
+  responses: Array<{
+    body?: unknown
+    text?: string
+    status?: number
+    headers?: Record<string, string>
+  }>,
+): {fetch: (url: string, init: RequestInit) => Promise<Response>; calls: string[]} {
+  const calls: string[] = []
+  let idx = 0
+  const fetchFn = async (url: string, _init: RequestInit): Promise<Response> => {
+    calls.push(url)
+    const r = responses[idx] ?? responses[responses.length - 1]
+    idx++
+    const headers = new Headers({'content-type': 'application/json', ...(r?.headers ?? {})})
+    const bodyText = r?.text ?? JSON.stringify(r?.body ?? {})
+    return new Response(bodyText, {status: r?.status ?? 200, headers})
+  }
+  return {fetch: fetchFn, calls}
+}
+
+describe('paginate — cursor 스타일', () => {
+  it('3 페이지 (각 5개 item) → 누적 15개', async () => {
+    const {fetch, calls} = makeMockFetch([
+      {body: {data: [1, 2, 3, 4, 5], meta: {next_cursor: 'c1'}}},
+      {body: {data: [6, 7, 8, 9, 10], meta: {next_cursor: 'c2'}}},
+      {body: {data: [11, 12, 13, 14, 15], meta: {next_cursor: null}}},
+    ])
+    const cfg = normalizePaginationConfig({
+      style: 'cursor',
+      pageParam: 'cursor',
+      itemsPath: 'data',
+      nextPath: 'meta.next_cursor',
+    })
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch)
+    expect(items).toHaveLength(15)
+    expect(items).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+    expect(calls).toHaveLength(3)
+    expect(calls[0]).toBe('http://api/items')
+    expect(calls[1]).toBe('http://api/items?cursor=c1')
+    expect(calls[2]).toBe('http://api/items?cursor=c2')
+  })
+
+  it('next_cursor 가 빈 문자열이면 종료', async () => {
+    const {fetch, calls} = makeMockFetch([
+      {body: {data: [1, 2], meta: {next_cursor: ''}}},
+    ])
+    const cfg = normalizePaginationConfig({
+      style: 'cursor', pageParam: 'cursor', itemsPath: 'data', nextPath: 'meta.next_cursor',
+    })
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch)
+    expect(items).toEqual([1, 2])
+    expect(calls).toHaveLength(1)
+  })
+
+  it('itemsPath 가 dot-path 인 경우 (data.items)', async () => {
+    const {fetch} = makeMockFetch([
+      {body: {data: {items: ['a', 'b']}, next: 'X'}},
+      {body: {data: {items: ['c']}, next: null}},
+    ])
+    const cfg = normalizePaginationConfig({
+      style: 'cursor', pageParam: 'cursor', itemsPath: 'data.items', nextPath: 'next',
+    })
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch)
+    expect(items).toEqual(['a', 'b', 'c'])
+  })
+
+  it('next URL 이 변하지 않으면 무한 루프 가드로 중단', async () => {
+    // next_cursor 가 매번 같은 값을 돌려주는 망가진 API 시뮬레이션
+    const {fetch, calls} = makeMockFetch([
+      {body: {data: [1], meta: {next_cursor: 'same'}}},
+      {body: {data: [2], meta: {next_cursor: 'same'}}},
+      {body: {data: [3], meta: {next_cursor: 'same'}}},
+    ])
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+    const cfg = normalizePaginationConfig({
+      style: 'cursor', pageParam: 'cursor', itemsPath: 'data', nextPath: 'meta.next_cursor',
+    })
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch)
+    // 첫번째: http://api/items, 두번째: http://api/items?cursor=same → 세번째도 같은 URL → 중단
+    expect(calls.length).toBeLessThanOrEqual(3)
+    expect(items.length).toBeGreaterThan(0)
+    warnSpy.mockRestore()
+  })
+})
+
+describe('paginate — offset 스타일', () => {
+  it('빈 페이지가 나오면 종료', async () => {
+    const {fetch, calls} = makeMockFetch([
+      {body: [1, 2, 3]},
+      {body: [4, 5, 6]},
+      {body: [7]},
+      {body: []}, // 빈 페이지 → stop
+    ])
+    const cfg = normalizePaginationConfig({
+      style: 'offset', pageParam: 'page', sizeParam: 'limit', perPage: 3,
+    })
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch)
+    expect(items).toEqual([1, 2, 3, 4, 5, 6, 7])
+    expect(calls).toHaveLength(4)
+    // 첫 호출: 시작 page=1 자동주입 + limit=3
+    expect(calls[0]).toMatch(/page=1/)
+    expect(calls[0]).toMatch(/limit=3/)
+    expect(calls[1]).toMatch(/page=2/)
+    expect(calls[2]).toMatch(/page=3/)
+    expect(calls[3]).toMatch(/page=4/)
+  })
+
+  it('itemsPath 로 응답 본문 안의 array 를 누적', async () => {
+    const {fetch} = makeMockFetch([
+      {body: {results: [{id: 1}, {id: 2}]}},
+      {body: {results: [{id: 3}]}},
+      {body: {results: []}},
+    ])
+    const cfg = normalizePaginationConfig({
+      style: 'offset', pageParam: 'page', itemsPath: 'results',
+    })
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch)
+    expect(items).toEqual([{id: 1}, {id: 2}, {id: 3}])
+  })
+
+  it('호출자가 이미 query 에 page=N 을 넣어두면 그 값부터 시작', async () => {
+    const {fetch, calls} = makeMockFetch([
+      {body: [1]},
+      {body: []},
+    ])
+    const cfg = normalizePaginationConfig({style: 'offset', pageParam: 'page'})
+    await paginate({url: 'http://api/items?page=5', init: {method: 'GET'}}, cfg, fetch)
+    expect(calls[0]).toBe('http://api/items?page=5')
+    expect(calls[1]).toMatch(/page=6/)
+  })
+})
+
+describe('paginate — link-header 스타일', () => {
+  it('Link: <next>; rel="next" 가 있으면 따라가고, 없으면 종료', async () => {
+    const {fetch, calls} = makeMockFetch([
+      {body: [1, 2], headers: {link: '<http://api/items?page=2>; rel="next"'}},
+      {body: [3, 4], headers: {link: '<http://api/items?page=3>; rel="next"'}},
+      {body: [5], headers: {link: '<http://api/items?page=1>; rel="prev"'}}, // no rel="next"
+    ])
+    const cfg = normalizePaginationConfig({style: 'link-header'})
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch)
+    expect(items).toEqual([1, 2, 3, 4, 5])
+    expect(calls).toHaveLength(3)
+    expect(calls[1]).toBe('http://api/items?page=2')
+    expect(calls[2]).toBe('http://api/items?page=3')
+  })
+
+  it('첫 응답에 Link 헤더가 없으면 1 페이지로 종료', async () => {
+    const {fetch, calls} = makeMockFetch([
+      {body: ['x', 'y']},
+    ])
+    const cfg = normalizePaginationConfig({style: 'link-header'})
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch)
+    expect(items).toEqual(['x', 'y'])
+    expect(calls).toHaveLength(1)
+  })
+
+  it('itemsPath 와 함께 동작', async () => {
+    const {fetch} = makeMockFetch([
+      {body: {data: [1, 2]}, headers: {link: '<http://api/items?p=2>; rel="next"'}},
+      {body: {data: [3]}},
+    ])
+    const cfg = normalizePaginationConfig({style: 'link-header', itemsPath: 'data'})
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch)
+    expect(items).toEqual([1, 2, 3])
+  })
+})
+
+describe('paginate — maxPages 안전 한계', () => {
+  it('maxPages 도달 시 warning 후 중단', async () => {
+    // 무한 next_cursor 를 만들기 위해 매번 다른 값을 돌려주는 응답 생성
+    let counter = 0
+    const fetchFn = async (_url: string, _init: RequestInit): Promise<Response> => {
+      counter++
+      const body = JSON.stringify({data: [counter], meta: {next_cursor: `c${counter}`}})
+      return new Response(body, {status: 200, headers: new Headers({'content-type': 'application/json'})})
+    }
+    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+    const cfg = normalizePaginationConfig({
+      style: 'cursor', pageParam: 'cursor', itemsPath: 'data', nextPath: 'meta.next_cursor', maxPages: 5,
+    })
+    const items = await paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetchFn)
+    expect(items).toHaveLength(5) // 정확히 maxPages 만큼만
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('maxPages=5'))
+    warnSpy.mockRestore()
+  })
+})
+
+describe('paginate — error 처리', () => {
+  it('non-2xx 응답이면 에러를 던진다', async () => {
+    const {fetch} = makeMockFetch([
+      {body: [1]},
+      {body: {error: 'oops'}, status: 500},
+    ])
+    const cfg = normalizePaginationConfig({style: 'link-header'})
+    // 첫 페이지는 link 헤더 없음 → 사실 1페이지로 끝나버림. status=500 페이지가 사용되도록 link 헤더를 강제로 넣자.
+    const {fetch: fetch2} = makeMockFetch([
+      {body: [1], headers: {link: '<http://api/items?p=2>; rel="next"'}},
+      {text: 'oops', status: 500, headers: {'content-type': 'text/plain'}},
+    ])
+    void fetch
+    await expect(
+      paginate({url: 'http://api/items', init: {method: 'GET'}}, cfg, fetch2),
+    ).rejects.toThrow(/HTTP 500/)
+  })
+})
+
+// ── Pagination — HTTPProvider.execute() integration ─────────────────────────
+
+describe('HTTPProvider.execute — pagination 통합', () => {
+  let server: http.Server
+  let baseUrl: string
+  let pageHandler: (req: http.IncomingMessage, res: http.ServerResponse) => void
+
+  // 이 describe 블록에서만 사용하는 가벼운 에코 서버.
+  // beforeAll/afterAll 을 vitest API 로 직접 호출.
+  const setup = async () => {
+    server = http.createServer((req, res) => pageHandler(req, res))
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as AddressInfo).port
+    baseUrl = `http://127.0.0.1:${port}`
+  }
+  const teardown = async () => {
+    await new Promise<void>((resolve) => server.close(() => resolve()))
+  }
+
+  function makeProvider(extra: Partial<HttpProviderConfig> & {pagination?: unknown} = {}): HTTPProvider {
+    return new HTTPProvider({baseUrl, ...extra} as HttpProviderConfig, 'test')
+  }
+
+  function makeSpec(): CommandSpec {
+    return {
+      id: 'test:list', namespace: 'test', description: 't',
+      args: [], flags: [], examples: [],
+      providerType: 'http',
+      providerConfig: {type: 'http', method: 'GET', path: '/items'},
+    }
+  }
+
+  it('case 1 — cursor: 3 페이지 누적 (provider.execute)', async () => {
+    await setup()
+    try {
+      let page = 0
+      pageHandler = (req, res) => {
+        const url = new URL(req.url!, 'http://x')
+        const cursor = url.searchParams.get('cursor')
+        let body: unknown
+        if (cursor === null) {
+          body = {data: [1, 2, 3, 4, 5], meta: {next_cursor: 'c1'}}
+        } else if (cursor === 'c1') {
+          body = {data: [6, 7, 8, 9, 10], meta: {next_cursor: 'c2'}}
+        } else {
+          body = {data: [11, 12, 13, 14, 15], meta: {next_cursor: null}}
+        }
+        page++
+        res.writeHead(200, {'Content-Type': 'application/json'})
+        res.end(JSON.stringify(body))
+      }
+      const provider = makeProvider({
+        pagination: {
+          style: 'cursor',
+          pageParam: 'cursor',
+          itemsPath: 'data',
+          nextPath: 'meta.next_cursor',
+        },
+      })
+      const result = await provider.execute(makeSpec(), {args: {}, flags: {all: true}, raw: []})
+      expect(result.success).toBe(true)
+      expect(Array.isArray(result.data)).toBe(true)
+      expect((result.data as number[])).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
+      expect(page).toBe(3)
+    } finally {
+      await teardown()
+    }
+  })
+
+  it('case 2 — offset: 페이지 4까지 (마지막 비면 종료)', async () => {
+    await setup()
+    try {
+      const pages: Record<string, unknown[]> = {
+        '1': [1, 2, 3], '2': [4, 5, 6], '3': [7], '4': [],
+      }
+      pageHandler = (req, res) => {
+        const url = new URL(req.url!, 'http://x')
+        const p = url.searchParams.get('page') ?? '1'
+        res.writeHead(200, {'Content-Type': 'application/json'})
+        res.end(JSON.stringify(pages[p] ?? []))
+      }
+      const provider = makeProvider({
+        pagination: {style: 'offset', pageParam: 'page'},
+      })
+      const result = await provider.execute(makeSpec(), {args: {}, flags: {all: true}, raw: []})
+      expect(result.success).toBe(true)
+      expect(result.data).toEqual([1, 2, 3, 4, 5, 6, 7])
+    } finally {
+      await teardown()
+    }
+  })
+
+  it('case 3 — link-header: rel="next" 헤더 따라가다 없으면 종료', async () => {
+    await setup()
+    try {
+      let n = 0
+      pageHandler = (_req, res) => {
+        n++
+        const headers: Record<string, string> = {'Content-Type': 'application/json'}
+        if (n < 3) {
+          headers['Link'] = `<${baseUrl}/items?p=${n + 1}>; rel="next"`
+        }
+        res.writeHead(200, headers)
+        res.end(JSON.stringify([n * 10, n * 10 + 1]))
+      }
+      const provider = makeProvider({pagination: {style: 'link-header'}})
+      const result = await provider.execute(makeSpec(), {args: {}, flags: {all: true}, raw: []})
+      expect(result.success).toBe(true)
+      expect(result.data).toEqual([10, 11, 20, 21, 30, 31])
+      expect(n).toBe(3)
+    } finally {
+      await teardown()
+    }
+  })
+
+  it('case 4 — maxPages 도달 시 warning + 중단', async () => {
+    await setup()
+    try {
+      let count = 0
+      pageHandler = (_req, res) => {
+        count++
+        res.writeHead(200, {'Content-Type': 'application/json'})
+        // 무한 next_cursor (값을 매번 다르게)
+        res.end(JSON.stringify({data: [count], meta: {next_cursor: `c${count}`}}))
+      }
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+      const provider = makeProvider({
+        pagination: {
+          style: 'cursor', pageParam: 'cursor', itemsPath: 'data',
+          nextPath: 'meta.next_cursor', maxPages: 4,
+        },
+      })
+      const result = await provider.execute(makeSpec(), {args: {}, flags: {all: true}, raw: []})
+      expect(result.success).toBe(true)
+      expect(count).toBe(4)
+      expect((result.data as unknown[])).toHaveLength(4)
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining('maxPages=4'))
+      warnSpy.mockRestore()
+    } finally {
+      await teardown()
+    }
+  })
+
+  it('case 5 — pagination 없으면 기존 단일 fetch 동작 보존', async () => {
+    await setup()
+    try {
+      let count = 0
+      pageHandler = (_req, res) => {
+        count++
+        res.writeHead(200, {'Content-Type': 'application/json'})
+        res.end(JSON.stringify({data: [1, 2, 3]}))
+      }
+      const provider = makeProvider() // pagination 없음
+      const result = await provider.execute(makeSpec(), {args: {}, flags: {all: true}, raw: []})
+      expect(result.success).toBe(true)
+      // 단일 fetch — data 는 응답 본문 그대로 (배열 아님)
+      expect(result.data).toEqual({data: [1, 2, 3]})
+      expect(count).toBe(1)
+    } finally {
+      await teardown()
+    }
+  })
+
+  it('case 5b — pagination 있어도 flags.all=false 면 단일 fetch', async () => {
+    await setup()
+    try {
+      let count = 0
+      pageHandler = (_req, res) => {
+        count++
+        res.writeHead(200, {'Content-Type': 'application/json'})
+        res.end(JSON.stringify({data: [1, 2], meta: {next_cursor: 'c1'}}))
+      }
+      const provider = makeProvider({
+        pagination: {
+          style: 'cursor', pageParam: 'cursor', itemsPath: 'data', nextPath: 'meta.next_cursor',
+        },
+      })
+      const result = await provider.execute(makeSpec(), {args: {}, flags: {}, raw: []})
+      expect(result.success).toBe(true)
+      // 단일 fetch — data 는 응답 본문 그대로
+      expect(result.data).toEqual({data: [1, 2], meta: {next_cursor: 'c1'}})
+      expect(count).toBe(1)
+    } finally {
+      await teardown()
+    }
+  })
+
+  it('case 6 — itemsPath 가 dot-path (data.items)', async () => {
+    await setup()
+    try {
+      let n = 0
+      pageHandler = (_req, res) => {
+        n++
+        const headers: Record<string, string> = {'Content-Type': 'application/json'}
+        if (n < 2) headers['Link'] = `<${baseUrl}/items?p=${n + 1}>; rel="next"`
+        res.writeHead(200, headers)
+        res.end(JSON.stringify({data: {items: [`a${n}`, `b${n}`]}}))
+      }
+      const provider = makeProvider({
+        pagination: {style: 'link-header', itemsPath: 'data.items'},
+      })
+      const result = await provider.execute(makeSpec(), {args: {}, flags: {all: true}, raw: []})
+      expect(result.success).toBe(true)
+      expect(result.data).toEqual(['a1', 'b1', 'a2', 'b2'])
+    } finally {
+      await teardown()
+    }
+  })
+
+  it('잘못된 pagination 설정은 HTTP_PAGINATION_CONFIG_ERROR 반환', async () => {
+    await setup()
+    try {
+      pageHandler = (_req, res) => {
+        res.writeHead(200, {'Content-Type': 'application/json'})
+        res.end('{}')
+      }
+      const provider = makeProvider({pagination: {style: 'bogus'} as unknown as object})
+      const result = await provider.execute(makeSpec(), {args: {}, flags: {all: true}, raw: []})
+      expect(result.success).toBe(false)
+      expect(result.error?.code).toBe('HTTP_PAGINATION_CONFIG_ERROR')
+    } finally {
+      await teardown()
+    }
+  })
+
+  it('non-2xx 응답이면 HTTP_PAGINATION_ERROR 반환', async () => {
+    await setup()
+    try {
+      let n = 0
+      pageHandler = (_req, res) => {
+        n++
+        if (n === 1) {
+          res.writeHead(200, {'Content-Type': 'application/json', Link: `<${baseUrl}/items?p=2>; rel="next"`})
+          res.end(JSON.stringify([1, 2]))
+        } else {
+          res.writeHead(500, {'Content-Type': 'text/plain'})
+          res.end('boom')
+        }
+      }
+      const provider = makeProvider({pagination: {style: 'link-header'}})
+      const result = await provider.execute(makeSpec(), {args: {}, flags: {all: true}, raw: []})
+      expect(result.success).toBe(false)
+      expect(result.error?.code).toBe('HTTP_PAGINATION_ERROR')
+      expect(result.error?.message).toMatch(/HTTP 500/)
+    } finally {
+      await teardown()
+    }
   })
 })

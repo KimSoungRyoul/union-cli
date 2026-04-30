@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.union-cli/
+oclif.manifest.json
+*.tsbuildinfo
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/

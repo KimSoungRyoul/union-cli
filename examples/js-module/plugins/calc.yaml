@@ -1,0 +1,58 @@
+# plugins/calc.yaml
+# JS Provider 데모 — 로컬 ESM 모듈을 in-process 로 호출
+# 호출 흐름: calc -> union-cli -> import('./dist/calc.js') -> add/multiply/sum
+name: calc
+namespace: calc
+description: "로컬 ESM 모듈을 호출하는 JS Provider 데모"
+
+provider:
+  type: js
+  config:
+    # ./dist/calc.js 는 src/calc.ts 가 tsc 로 빌드된 결과물입니다.
+    # `npm run build` (또는 `npm run build:ts`) 후에 동작합니다.
+    module: "./dist/calc.js"
+
+commands:
+  - id: math:add
+    description: "두 수를 더합니다"
+    js:
+      function: "add"
+    flags:
+      - name: a
+        type: number
+        required: true
+        description: "첫 번째 피연산자"
+      - name: b
+        type: number
+        required: true
+        description: "두 번째 피연산자"
+    examples:
+      - "calc calc math add --a 2 --b 3 --json"
+
+  - id: math:multiply
+    description: "두 수를 곱합니다"
+    js:
+      function: "multiply"
+    flags:
+      - name: a
+        type: number
+        required: true
+        description: "첫 번째 피연산자"
+      - name: b
+        type: number
+        required: true
+        description: "두 번째 피연산자"
+    examples:
+      - "calc calc math multiply --a 4 --b 5 --json"
+
+  - id: math:sum
+    description: "숫자 배열의 합"
+    js:
+      function: "sum"
+    flags:
+      - name: numbers
+        required: true
+        description: "콤마 구분 숫자 리스트 (예: 1,2,3,4,5)"
+        httpBodyType: number-array
+    examples:
+      - "calc calc math sum --numbers 1,2,3,4,5 --json"

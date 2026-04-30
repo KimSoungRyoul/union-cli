@@ -1,0 +1,61 @@
+# plugins/git.yaml
+# git 명령을 union-cli 커맨드로 wrapping
+# CLI Provider 데모 — 외부 바이너리(git)를 spawn 하여 표준 출력 파싱
+name: git-wrap
+namespace: git
+description: "git 명령을 통합 CLI 로 wrapping (CLI Provider 데모)"
+
+provider:
+  type: cli
+  config:
+    binary: git
+    # globalFlags 는 모든 git 호출에 공통으로 붙는 플래그입니다.
+    # 여기서는 비워두고, 커맨드별로 필요한 인자를 template 에 직접 넣습니다.
+    globalFlags: []
+
+commands:
+  - id: status:show
+    description: "작업 트리 상태 (machine-readable porcelain 포맷)"
+    cli:
+      template: "status --porcelain"
+    outputParser: lines
+    examples:
+      - "gw git status show"
+      - "gw git status show --json"
+
+  - id: log:recent
+    description: "최근 커밋 N개 (oneline)"
+    cli:
+      template: "log --oneline -n {count}"
+    args:
+      - name: count
+        required: false
+        default: "10"
+        description: "조회할 커밋 개수"
+    outputParser: lines
+    examples:
+      - "gw git log recent"
+      - "gw git log recent 5 --json"
+
+  - id: diff:stat
+    description: "변경 파일별 diff 통계"
+    cli:
+      template: "diff --stat"
+    outputParser: lines
+    examples:
+      - "gw git diff stat"
+
+  - id: branch:list
+    description: "로컬 브랜치 목록"
+    cli:
+      template: "branch --list"
+    outputParser: lines
+    flags:
+      - name: all
+        type: boolean
+        char: "a"
+        cliMap: "--all"
+        description: "원격 브랜치 포함"
+    examples:
+      - "gw git branch list"
+      - "gw git branch list --all --json"

@@ -18,10 +18,11 @@ concurrency:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
         node-version: ["20", "22"]
     steps:
       - name: Checkout
@@ -45,5 +46,13 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Test
-        run: npm test
+      - name: Test with coverage
+        run: npm run test:coverage
+
+      - name: Upload coverage artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-node-${{ matrix.node-version }}
+          path: coverage/
+          retention-days: 7

@@ -1,0 +1,17 @@
+# python-sdk example expected outputs
+
+# `stats stats numbers describe --numbers 1,2,3,4,5 --json`
+{
+  "mean": 3.0,
+  "std": 1.4142135623730951,
+  "min": 1.0,
+  "max": 5.0,
+  "count": 5
+}
+
+# `stats stats numbers percentile --numbers 10,20,30,40,50 --p 90 --json`
+46.0
+
+# 검증 (Python 만 직접 실행):
+# $ python -c "from python_module.stats import describe; print(describe([1,2,3,4,5]))"
+# {'mean': 3.0, 'std': 1.4142135623730951, 'min': 1.0, 'max': 5.0, 'count': 5}

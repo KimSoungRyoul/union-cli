@@ -1,0 +1,33 @@
+# `jp api posts list --json` 의 첫 1~2개 항목 (네트워크 호출 결과 스냅샷)
+# 실제 호출 시 100개의 post 가 반환됩니다. (id 1~100)
+
+[
+  {
+    "userId": 1,
+    "id": 1,
+    "title": "sunt aut facere repellat provident occaecati excepturi optio reprehenderit",
+    "body": "quia et suscipit\nsuscipit recusandae consequuntur expedita et cum\nreprehenderit molestiae ut ut quas totam\nnostrum rerum est autem sunt rem eveniet architecto"
+  },
+  {
+    "userId": 1,
+    "id": 2,
+    "title": "qui est esse",
+    "body": "est rerum tempore vitae\nsequi sint nihil reprehenderit dolor beatae ea dolores neque\nfugiat blanditiis voluptate porro vel nihil molestiae ut reiciendis\nqui aperiam non debitis possimus qui neque nisi nulla"
+  }
+]
+
+# `jp api posts get 1 --json` (단일 post)
+{
+  "userId": 1,
+  "id": 1,
+  "title": "sunt aut facere repellat provident occaecati excepturi optio reprehenderit",
+  "body": "quia et suscipit\nsuscipit recusandae consequuntur expedita et cum\nreprehenderit molestiae ut ut quas totam\nnostrum rerum est autem sunt rem eveniet architecto"
+}
+
+# `jp api posts create --title 'Hello' --body 'World' --json` (POST mock)
+{
+  "title": "Hello",
+  "body": "World",
+  "userId": 1,
+  "id": 101
+}

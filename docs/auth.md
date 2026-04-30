@@ -68,6 +68,33 @@ token:
 
 ---
 
+## Credential 저장소
+
+획득한 토큰이나 OAuth 쿠키 같은 credential 은 `provider.config.credentialStore` 옵션으로 저장 방식을 선택할 수 있습니다.
+
+```yaml
+provider:
+  type: http
+  config:
+    baseUrl: "https://api.example.com"
+    credentialStore: keychain    # file | keychain | env
+    auth:
+      type: bearer
+      token: { env: "API_TOKEN" }
+```
+
+| 값 | 동작 | 사용 사례 |
+|----|------|-----------|
+| `file` (기본) | `~/.<cli-name>/credentials/<ns>.json` (`chmod 0600`) | 기본/개인 |
+| `keychain` | macOS Keychain (`security`) · Linux libsecret (`secret-tool`) · Windows Credential Manager (`cmdkey` + sidecar) | 데스크톱 |
+| `env` | `<CLI_UPPER>_<NS_UPPER>_TOKEN` 환경변수 (read-only, set/delete 시 throw) | CI/CD |
+
+**Graceful fallback**: `keychain` 선택 시 OS CLI 가 PATH 에 없으면 `file` 로 자동 fallback (warning 출력).
+
+**Windows 제약**: `cmdkey` 가 password 회수를 지원하지 않아 실제 payload 는 `%APPDATA%/<cli>/keychain-fallback/<ns>.json` 에 NTFS ACL 의존으로 저장됩니다.
+
+---
+
 ## none - 인증 없음
 
 공개 API에 사용합니다. 인증 헤더가 추가되지 않습니다.
