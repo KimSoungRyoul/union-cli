@@ -849,9 +849,17 @@ export class HTTPProvider implements IProvider {
                 access_token: string; refresh_token?: string; expires_in?: number;
               }
               accessToken = refreshed.access_token
+              // RFC 6749 best practice — refresh_token rotation:
+              // 응답에 새 refresh_token 이 있고 비어있지 않으면 교체, 그 외에는 기존 값 유지.
+              // 빈 문자열은 보수적으로 기존 값 유지 (쓸 수 없는 값으로 교체되어 다음 refresh 가 실패하는 것 방지).
+              const newRefresh =
+                typeof refreshed.refresh_token === 'string' && refreshed.refresh_token.trim().length > 0
+                  ? refreshed.refresh_token
+                  : stored.refresh_token
+              const rotated = newRefresh !== stored.refresh_token
               tokens[serviceName] = {
                 access_token: refreshed.access_token,
-                refresh_token: refreshed.refresh_token ?? stored.refresh_token,
+                refresh_token: newRefresh,
                 expires_in: refreshed.expires_in ?? stored.expires_in,
                 savedAt: new Date().toISOString(),
                 authType: 'device-code',
@@ -859,7 +867,9 @@ export class HTTPProvider implements IProvider {
               const dir = tokenFile.substring(0, tokenFile.lastIndexOf('/'))
               await mkdir(dir, {recursive: true})
               await writeFile(tokenFile, JSON.stringify(tokens, null, 2))
-              logger.debug(`[device-code] ${this.namespace}: 토큰 자동 갱신 성공`)
+              logger.debug(
+                `[device-code] ${this.namespace}: 토큰 자동 갱신 성공${rotated ? ' (refresh_token rotated)' : ''}`,
+              )
             } else {
               logger.warn(`Warning: token refresh failed (${resp.status}). 재로그인이 필요할 수 있습니다.`)
             }
