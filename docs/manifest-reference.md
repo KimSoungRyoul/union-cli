@@ -100,6 +100,14 @@ provider:
       X-Custom: "value"
     timeout: 30000                           # 선택. 타임아웃 (ms, 기본 30000)
     credentialStore: file                    # 선택. file | keychain | env (기본 file)
+    pagination:                              # 선택. 페이지네이션 (기본 비활성화)
+      style: cursor                          # cursor | offset | link-header
+      pageParam: cursor                      # 다음 페이지 query param (cursor/offset)
+      sizeParam: limit                       # page size query param (선택)
+      itemsPath: data                        # 응답 본문에서 items 위치 (dot-path)
+      nextPath: meta.next_cursor             # cursor 스타일에서 next cursor 위치
+      maxPages: 100                          # 안전 한계 (기본 100)
+      perPage: 50                            # 시작 page size (선택)
     retry:                                   # 선택. 재시도 정책 (기본 attempts: 1 = no retry)
       attempts: 3
       initialDelayMs: 200                    # exponential backoff 의 base
@@ -109,6 +117,13 @@ provider:
       jitter: full                           # full | equal | none
       idempotent: auto                       # auto = GET/HEAD/PUT/DELETE 만 retry, true | false
 ```
+
+**Pagination 동작**:
+- `--all` flag 가 주어지면 페이지를 누적해 단일 array 로 반환.
+- `cursor`: 응답의 `nextPath` 위치에서 다음 cursor 추출, `pageParam` 로 다음 요청.
+- `offset`: `pageParam` (또는 page index) 을 증가시키며 `itemsPath` 가 비면 중지.
+- `link-header`: RFC 5988 `Link: <url>; rel="next"` 헤더 파싱.
+- `maxPages` 도달 시 warning + 중지. `paginate()` 는 retry 정책과 자동 통합.
 
 **Retry 동작**:
 - 응답 status 가 `retryOn` 에 포함되거나 fetch 자체가 실패 (네트워크 에러 / AbortError) 한 경우 재시도.

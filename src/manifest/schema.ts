@@ -17,6 +17,20 @@ export const manifestSchema = {
           additionalProperties: true,
           properties: {
             credentialStore: {type: 'string', enum: ['file', 'keychain', 'env'], default: 'file'},
+            pagination: {
+              type: 'object',
+              additionalProperties: false,
+              required: ['style'],
+              properties: {
+                style: {type: 'string', enum: ['cursor', 'offset', 'link-header']},
+                pageParam: {type: 'string'},
+                sizeParam: {type: 'string'},
+                itemsPath: {type: 'string'},
+                nextPath: {type: 'string'},
+                maxPages: {type: 'integer', minimum: 1, default: 100},
+                perPage: {type: 'integer', minimum: 1},
+              },
+            },
             retry: {
               type: 'object',
               additionalProperties: false,

@@ -179,6 +179,53 @@ provider:
 - 401 은 retry 정책 미적용 (auth-handlers 의 JWT refresh 가 처리)
 - `Retry-After` 헤더가 있으면 우선 (단 `maxDelayMs` cap)
 
+## HTTP Pagination
+
+cursor / offset / link-header 3종 페이지네이션을 manifest 로 선언할 수 있습니다.
+
+```yaml
+provider:
+  type: http
+  config:
+    baseUrl: https://api.example.com
+    pagination:
+      style: cursor              # cursor | offset | link-header
+      pageParam: cursor
+      itemsPath: data
+      nextPath: meta.next_cursor
+      maxPages: 100
+```
+
+명령 실행 시 `--all` 플래그를 주면 모든 페이지를 누적해 단일 array 로 반환합니다. retry 정책과도 자동 통합 (각 페이지 요청에 retry 적용).
+
+## Interactive Prompt
+
+TTY 환경에서 required flag 가 누락되면 자동으로 prompt 됩니다 (`password`/`token`/`secret` 등은 hidden 입력).
+
+```bash
+my-cli api users create     # email 누락 시 prompt
+> ? email: john@example.com
+```
+
+- `--no-input` flag 또는 `NO_INPUT=1`/`UNION_CLI_NO_INPUT=1` 환경변수로 비활성화 (CI/스크립트용)
+- non-TTY 환경에서는 자동으로 prompt 미실행 → oclif 의 missing-flag 에러로 fallback
+
+## Windows 지원
+
+- Python provider 의 venv 경로가 win32 에서 자동으로 `Scripts/python.exe` 로 분기됩니다.
+- CI matrix 가 `ubuntu-latest` × `windows-latest` × `macos-latest` × `node 20/22` = 6 조합으로 검증됩니다.
+
+## 테스트
+
+```bash
+npm test              # 전체 (unit + e2e)
+npm run test:unit     # unit 만 (빠름)
+npm run test:e2e      # e2e 만 (./bin/dev.js 통합 검증)
+npm run test:coverage # 커버리지 포함
+```
+
+E2E 는 `./bin/dev.js` (tsx) 를 사용해 `npm run build` 의존성 없이 실행됩니다.
+
 ---
 
 ## Architecture
