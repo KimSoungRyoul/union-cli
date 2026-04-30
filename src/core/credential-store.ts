@@ -85,7 +85,7 @@ export async function resolveSecret(ref: SecretRef): Promise<string | null> {
         return null
       }
       if (nodeErr.code === 'EACCES') {
-        throw new Error(`Permission denied reading secret file: "${ref.file}". Check file permissions.`)
+        throw new Error(`Permission denied reading secret file: "${ref.file}". Check file permissions.`, {cause: err})
       }
       throw err
     }
@@ -99,12 +99,12 @@ export async function resolveSecret(ref: SecretRef): Promise<string | null> {
     } catch (err: unknown) {
       const nodeErr = err as NodeJS.ErrnoException
       if (nodeErr.code === 'ENOENT') {
-        throw new Error(`Command not found: "${ref.command.split(/\s+/)[0]}". Ensure it is installed and in your PATH.`)
+        throw new Error(`Command not found: "${ref.command.split(/\s+/)[0]}". Ensure it is installed and in your PATH.`, {cause: err})
       }
       const execErr = err as {status?: number; stderr?: Buffer | string}
       const stderr = execErr.stderr ? execErr.stderr.toString().trim() : ''
       const exitCode = execErr.status ?? 'unknown'
-      throw new Error(`Secret command failed (exit code ${exitCode}): "${ref.command}"${stderr ? `\n${stderr}` : ''}`)
+      throw new Error(`Secret command failed (exit code ${exitCode}): "${ref.command}"${stderr ? `\n${stderr}` : ''}`, {cause: err})
     }
   }
 
