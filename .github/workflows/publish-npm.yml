@@ -3,9 +3,29 @@ name: Publish to npm
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish (e.g. 0.2.0)"
+        required: true
+
+# npm Trusted Publishing (OIDC)
+#  사전 설정 필요 (1회):
+#    1. https://www.npmjs.com/package/union-cli/access  (또는 first publish 후)
+#    2. "Trusted Publisher" 추가 → GitHub Actions 선택
+#       - Organization or user: KimSoungRyoul
+#       - Repository: union-cli
+#       - Workflow filename: publish-npm.yml
+#       - Environment name: (비워둠)
+#    3. create-union-cli 패키지에도 동일하게 등록
+#
+#  최초 publish 시점에는 trusted publisher 등록 전이므로
+#  1회만 로컬에서 `npm publish --access public`로 시드 publish 후
+#  위 절차를 진행한다.
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -17,28 +37,36 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           registry-url: "https://registry.npmjs.org"
+          cache: "npm"
 
-      - name: Set version from git tag
+      - name: Upgrade npm to support Trusted Publishing
+        run: npm install -g npm@latest
+
+      - name: Resolve version
+        id: version
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          npm version "$VERSION" --no-git-tag-version
-          npm version "$VERSION" --no-git-tag-version --workspace=packages/create-union-cli
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "value=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set version on workspaces
+        run: |
+          npm version "${{ steps.version.outputs.value }}" --no-git-tag-version
+          npm version "${{ steps.version.outputs.value }}" --no-git-tag-version --workspace=packages/create-union-cli
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build
         run: npm run build
 
-      - name: Publish union-cli
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish union-cli (OIDC + provenance)
+        run: npm publish --access public --provenance
 
-      - name: Publish create-union-cli
+      - name: Publish create-union-cli (OIDC + provenance)
         working-directory: packages/create-union-cli
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
