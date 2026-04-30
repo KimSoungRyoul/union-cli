@@ -39,14 +39,14 @@ jobs:
             website/package-lock.json
 
       - name: Install root dependencies
-        run: npm ci --ignore-scripts
+        run: npm ci
 
       - name: Build union-cli
         run: npm run build
 
       - name: Install website dependencies
         working-directory: website
-        run: npm ci --ignore-scripts
+        run: npm ci
 
       - name: Build Docusaurus
         working-directory: website
