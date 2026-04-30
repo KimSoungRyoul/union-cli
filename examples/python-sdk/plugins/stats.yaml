@@ -1,0 +1,44 @@
+# plugins/stats.yaml
+# Python Provider 데모 — numpy 기반 통계 함수를 CLI 로 노출
+# 호출 흐름: gw -> union-cli -> python3 (JSON-RPC stdio) -> python_module.stats
+name: stats
+namespace: stats
+description: "numpy 기반 통계 SDK (Python Provider 데모)"
+
+provider:
+  type: python
+  config:
+    module: "python_module.stats"
+    # persistent: true 면 한 번 spawn 한 python3 프로세스를 재사용 → cold-start 오버헤드 제거
+    persistent: true
+    idleTimeout: 300
+
+commands:
+  - id: numbers:describe
+    description: "숫자 리스트의 기본 통계 (mean / std / min / max / count)"
+    python:
+      function: "describe"
+    flags:
+      - name: numbers
+        required: true
+        description: "콤마 구분 숫자 리스트 (예: 1,2,3,4,5)"
+        # httpBodyType 은 HTTP 가 아니어도 '콤마 → number 배열' 변환에 활용됩니다.
+        httpBodyType: number-array
+    examples:
+      - "stats stats numbers describe --numbers 1,2,3,4,5 --json"
+
+  - id: numbers:percentile
+    description: "숫자 리스트의 p 분위수"
+    python:
+      function: "percentile"
+    flags:
+      - name: numbers
+        required: true
+        description: "콤마 구분 숫자 리스트"
+        httpBodyType: number-array
+      - name: p
+        type: number
+        default: 50
+        description: "분위수 (0-100)"
+    examples:
+      - "stats stats numbers percentile --numbers 10,20,30,40,50 --p 90 --json"
