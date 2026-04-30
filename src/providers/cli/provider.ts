@@ -7,7 +7,7 @@ import type {
   ExecutionResult,
   PluginManifest,
 } from '../../core/types.js'
-import {spawnProcess} from './process.js'
+import {spawnProcess, type ProcessResult} from './process.js'
 import {parseOutput} from './output-parser.js'
 
 /**
@@ -128,7 +128,19 @@ export class CLIProvider implements IProvider {
         args,
       })
 
+      // process.ts ProcessResult is { stdout, stderr, exitCode }; signal is not
+      // surfaced today but we keep the field optional in details so the shape
+      // is forward-compatible if process.ts later exposes it.
+      const signal = (result as ProcessResult & {signal?: string | null}).signal ?? undefined
+
       if (result.exitCode !== 0) {
+        const stderrTrim = result.stderr.trim()
+        const stdoutTrim = result.stdout.trim()
+        const message =
+          stderrTrim ||
+          stdoutTrim ||
+          (signal ? `terminated by signal ${signal}` : `exit code ${result.exitCode}`)
+
         return {
           success: false,
           data: result.stderr || result.stdout,
@@ -136,21 +148,49 @@ export class CLIProvider implements IProvider {
           duration: performance.now() - startTime,
           error: {
             code: 'CLI_ERROR',
-            message: result.stderr.trim() || `Command exited with code ${result.exitCode}`,
+            message,
+            details: {
+              stderr: result.stderr,
+              stdout: result.stdout,
+              exitCode: result.exitCode,
+              ...(signal !== undefined ? {signal} : {}),
+            },
           },
         }
       }
 
       const parsed = parseOutput(result.stdout, cliConfig.outputParser)
 
+      // Even on success, capture non-empty stderr for debug/observability.
+      // (e.g. tools that print "Note:" / progress to stderr while exit 0.)
+      const stderrLog = result.stderr.trim()
       return {
         success: true,
         data: parsed,
         exitCode: 0,
         duration: performance.now() - startTime,
+        ...(stderrLog
+          ? {
+              error: {
+                code: 'CLI_STDERR_NOTICE',
+                message: stderrLog,
+                details: {
+                  stderr: result.stderr,
+                  stdout: result.stdout,
+                  exitCode: result.exitCode,
+                  ...(signal !== undefined ? {signal} : {}),
+                },
+              },
+            }
+          : {}),
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
+      // Heuristic: spawnProcess rejects with a "timed out ... and was killed"
+      // message after sending SIGKILL. Surface it under details.signal so the
+      // case-E shape stays consistent with the exit-path details shape.
+      const looksLikeTimeoutKill = /timed out .* killed/i.test(message)
+      const signal = looksLikeTimeoutKill ? 'SIGKILL' : undefined
       return {
         success: false,
         data: null,
@@ -159,6 +199,12 @@ export class CLIProvider implements IProvider {
         error: {
           code: 'CLI_EXECUTION_ERROR',
           message,
+          details: {
+            stderr: '',
+            stdout: '',
+            exitCode: 1,
+            ...(signal !== undefined ? {signal} : {}),
+          },
         },
       }
     }
