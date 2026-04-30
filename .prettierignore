@@ -1,0 +1,8 @@
+node_modules/
+dist/
+coverage/
+.union-cli/
+*.min.js
+package-lock.json
+website/build/
+website/.docusaurus/
