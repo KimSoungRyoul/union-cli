@@ -1,0 +1,10 @@
+# js-module example expected outputs
+
+# `calc calc math add --a 2 --b 3 --json`
+5
+
+# `calc calc math multiply --a 4 --b 5 --json`
+20
+
+# `calc calc math sum --numbers 1,2,3,4,5 --json`
+15

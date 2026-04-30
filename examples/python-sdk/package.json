@@ -1,0 +1,44 @@
+{
+  "name": "example-python-sdk",
+  "version": "0.1.0",
+  "description": "union-cli Python provider example — numpy stats via JSON-RPC",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "stats": "./bin/run.js"
+  },
+  "scripts": {
+    "build": "node --input-type=module -e \"import {build} from 'union-cli/dist/build/builder.js'; const r = await build({projectDir:'.', codegen:true, commandsDir:'./dist/commands'}); console.log(r.generatedFiles.length+' commands generated');\"",
+    "dev": "./bin/dev.js"
+  },
+  "oclif": {
+    "bin": "stats",
+    "dirname": "stats",
+    "commands": {
+      "strategy": "pattern",
+      "target": "./dist/commands"
+    },
+    "plugins": [
+      "@oclif/plugin-help",
+      "@oclif/plugin-autocomplete",
+      "union-cli"
+    ],
+    "topicSeparator": " "
+  },
+  "dependencies": {
+    "@oclif/core": "^4.2.8",
+    "@oclif/plugin-autocomplete": "^3.2.45",
+    "@oclif/plugin-help": "^6.2.27",
+    "ajv": "^8.17.1",
+    "union-cli": "file:../..",
+    "yaml": "^2.7.1"
+  },
+  "devDependencies": {
+    "oclif": "^4.17.38",
+    "tsx": "^4.19.4",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

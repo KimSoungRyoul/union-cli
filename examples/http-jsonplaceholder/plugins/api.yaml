@@ -1,0 +1,63 @@
+# plugins/api.yaml
+# JSONPlaceholder REST API — HTTP Provider 데모
+name: jsonplaceholder
+namespace: api
+description: "JSONPlaceholder API (free fake REST API for testing)"
+
+provider:
+  type: http
+  config:
+    baseUrl: "https://jsonplaceholder.typicode.com"
+    auth:
+      type: none
+    timeout: 10000
+
+commands:
+  - id: posts:list
+    description: "전체 posts 목록 조회"
+    http:
+      method: GET
+      path: "/posts"
+    flags:
+      - name: userId
+        type: number
+        description: "특정 사용자 ID로 필터링"
+        httpMap: query
+    examples:
+      - "jp api posts list --json"
+      - "jp api posts list --userId 1 --json"
+
+  - id: posts:get
+    description: "특정 post 상세 조회"
+    http:
+      method: GET
+      path: "/posts/{id}"
+    args:
+      - name: id
+        required: true
+        description: "Post ID"
+    examples:
+      - "jp api posts get 1 --json"
+
+  - id: posts:create
+    description: "새 post 생성"
+    http:
+      method: POST
+      path: "/posts"
+    successMessage: "Post '{title}' 생성 완료"
+    flags:
+      - name: title
+        required: true
+        description: "Post 제목"
+        httpMap: body
+      - name: body
+        required: true
+        description: "Post 본문"
+        httpMap: body
+      - name: userId
+        type: number
+        default: 1
+        description: "작성자 user ID"
+        httpMap: body
+    examples:
+      - "jp api posts create --title 'Hello' --body 'World' --json"

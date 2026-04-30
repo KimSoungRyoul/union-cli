@@ -3,17 +3,21 @@ import {existsSync} from 'node:fs'
 import {resolve} from 'node:path'
 
 export interface BridgeOptions {
-  pythonPath?: string   // default: 'python3'
-  module: string        // Python module to run
-  persistent?: boolean  // keep process alive
-  idleTimeout?: number  // ms, kill after idle (default 300000 = 5min)
-  venv?: string         // virtualenv path — prepend to PATH
+  pythonPath?: string         // default: 'python3'
+  module: string              // Python module to run
+  persistent?: boolean        // keep process alive
+  idleTimeout?: number        // ms, kill after idle (default 300000 = 5min)
+  venv?: string               // virtualenv path — prepend to PATH
+  callTimeoutMs?: number      // ms, reject a single call if no response (default 60_000)
+  shutdownGraceMs?: number    // ms, SIGTERM grace period before SIGKILL (default 3_000)
 }
 
 export interface BridgeCallResult {
   success: boolean
   data: unknown
   error?: string
+  /** stderr captured during the call (warnings, debug output, error tracebacks). */
+  stderrLog?: string
 }
 
 export class PythonBridge {
@@ -28,6 +32,8 @@ export class PythonBridge {
       persistent: options.persistent ?? false,
       idleTimeout: options.idleTimeout ?? 300_000,
       venv: options.venv ?? '',
+      callTimeoutMs: options.callTimeoutMs ?? 60_000,
+      shutdownGraceMs: options.shutdownGraceMs ?? 3_000,
     }
   }
 
@@ -37,6 +43,9 @@ export class PythonBridge {
    * 1. Ensure the bridge process is running (spawn if not).
    * 2. Send a JSON-RPC request via stdin.
    * 3. Read the response line from stdout.
+   *    - stderr is accumulated separately; warnings (DeprecationWarning, etc.)
+   *      are NOT treated as errors. Only abnormal exit (code !== 0) before a
+   *      response, an 'error' event, or a call timeout will reject.
    * 4. If not persistent, kill the process after the call.
    * 5. If persistent, reset the idle timer.
    */
@@ -55,40 +64,27 @@ export class PythonBridge {
     })
 
     return new Promise<BridgeCallResult>((resolvePromise, reject) => {
-      let responseLine = ''
+      let responseBuffer = ''
+      let stderrBuffer = ''
+      let settled = false
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null
 
-      const onData = (chunk: Buffer) => {
-        responseLine += chunk.toString()
-        // Wait until we have a complete line (newline-delimited JSON)
-        const newlineIndex = responseLine.indexOf('\n')
-        if (newlineIndex === -1) return
-
-        const line = responseLine.slice(0, newlineIndex).trim()
-        responseLine = responseLine.slice(newlineIndex + 1)
-
-        // Cleanup listener
+      const cleanup = () => {
         proc.stdout?.off('data', onData)
-        proc.stderr?.off('data', onError)
-
-        try {
-          const response = JSON.parse(line)
-
-          if (response.error) {
-            resolvePromise({
-              success: false,
-              data: null,
-              error: response.error.message ?? String(response.error),
-            })
-          } else {
-            resolvePromise({
-              success: true,
-              data: response.result,
-            })
-          }
-        } catch {
-          reject(new Error(`Failed to parse bridge response: ${line}`))
+        proc.stderr?.off('data', onStderr)
+        proc.off('exit', onExit)
+        proc.off('error', onProcError)
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle)
+          timeoutHandle = null
         }
+      }
 
+      const settleResolve = (result: BridgeCallResult) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolvePromise(result)
         // Post-call cleanup
         if (!this.options.persistent) {
           void this.shutdown()
@@ -97,41 +93,146 @@ export class PythonBridge {
         }
       }
 
-      const onError = (chunk: Buffer) => {
-        const stderr = chunk.toString().trim()
-        if (stderr) {
-          proc.stdout?.off('data', onData)
-          proc.stderr?.off('data', onError)
-          reject(new Error(`Python bridge stderr: ${stderr}`))
+      const settleReject = (err: Error) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(err)
+        if (!this.options.persistent) {
+          void this.shutdown()
         }
       }
 
-      proc.stdout?.on('data', onData)
-      proc.stderr?.on('data', onError)
+      const onData = (chunk: Buffer) => {
+        responseBuffer += chunk.toString()
+        // Wait until we have a complete line (newline-delimited JSON)
+        const newlineIndex = responseBuffer.indexOf('\n')
+        if (newlineIndex === -1) return
 
-      proc.on('error', (err) => {
-        proc.stdout?.off('data', onData)
-        proc.stderr?.off('data', onError)
-        reject(new Error(`Python bridge process error: ${err.message}`))
-      })
+        const line = responseBuffer.slice(0, newlineIndex).trim()
+        responseBuffer = responseBuffer.slice(newlineIndex + 1)
+
+        try {
+          const response = JSON.parse(line)
+          const stderrLog = stderrBuffer.trim() || undefined
+
+          if (response.error) {
+            settleResolve({
+              success: false,
+              data: null,
+              error: response.error.message ?? String(response.error),
+              stderrLog,
+            })
+          } else {
+            settleResolve({
+              success: true,
+              data: response.result,
+              stderrLog,
+            })
+          }
+        } catch {
+          settleReject(new Error(`Failed to parse bridge response: ${line}`))
+        }
+      }
+
+      const onStderr = (chunk: Buffer) => {
+        // Accumulate but do NOT reject — Python warnings (DeprecationWarning,
+        // FutureWarning, import-time prints) routinely arrive on stderr while
+        // the call still succeeds. The buffer is surfaced on the result via
+        // `stderrLog`, or used as the reject reason on abnormal exit.
+        stderrBuffer += chunk.toString()
+      }
+
+      const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+        // Process exited before delivering a response — treat as failure.
+        // (If a response had already arrived we would have settled in onData
+        // before the exit fires.)
+        this.process = null
+        const stderrTrim = stderrBuffer.trim()
+        const reason = stderrTrim
+          ? `Python bridge exited (code=${code}, signal=${signal ?? 'none'}): ${stderrTrim}`
+          : `Python bridge exited before response (code=${code}, signal=${signal ?? 'none'})`
+        settleReject(new Error(reason))
+      }
+
+      const onProcError = (err: Error) => {
+        settleReject(new Error(`Python bridge process error: ${err.message}`))
+      }
+
+      proc.stdout?.on('data', onData)
+      proc.stderr?.on('data', onStderr)
+      proc.on('exit', onExit)
+      proc.on('error', onProcError)
+
+      // Per-call timeout — guards against a hung Python function that never
+      // sends a response on stdout.
+      if (this.options.callTimeoutMs > 0) {
+        timeoutHandle = setTimeout(() => {
+          const stderrTrim = stderrBuffer.trim()
+          const detail = stderrTrim ? ` stderr: ${stderrTrim}` : ''
+          settleReject(new Error(
+            `Python bridge call timed out after ${this.options.callTimeoutMs}ms.${detail}`,
+          ))
+        }, this.options.callTimeoutMs)
+      }
 
       // Write the request to stdin
       proc.stdin?.write(request + '\n')
     })
   }
 
-  /** Kill the Python bridge process and clear timers. */
+  /**
+   * Kill the Python bridge process and clear timers.
+   *
+   * Sends SIGTERM first, then waits up to `shutdownGraceMs` for the process
+   * to exit gracefully. If it does not, sends SIGKILL.
+   */
   async shutdown(): Promise<void> {
     if (this.idleTimer) {
       clearTimeout(this.idleTimer)
       this.idleTimer = null
     }
 
-    if (this.process) {
-      this.process.stdin?.end()
-      this.process.kill()
-      this.process = null
+    const proc = this.process
+    if (!proc) return
+
+    this.process = null
+
+    // Already exited — nothing to do.
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      proc.stdin?.end()
+      return
     }
+
+    proc.stdin?.end()
+
+    await new Promise<void>((resolvePromise) => {
+      let done = false
+      const onExit = () => {
+        if (done) return
+        done = true
+        clearTimeout(killTimer)
+        resolvePromise()
+      }
+      proc.once('exit', onExit)
+
+      const killTimer = setTimeout(() => {
+        if (done) return
+        // Grace period elapsed — force kill.
+        try {
+          proc.kill('SIGKILL')
+        } catch {
+          // process may already be dead
+        }
+      }, this.options.shutdownGraceMs)
+
+      try {
+        proc.kill('SIGTERM')
+      } catch {
+        // process may already be dead — settle immediately
+        onExit()
+      }
+    })
   }
 
   /** Spawn the bridge process if it is not already running. */
@@ -140,8 +241,13 @@ export class PythonBridge {
       return this.process
     }
 
+    // Windows uses Scripts/python.exe; Unix uses bin/python3.
+    const isWindows = process.platform === 'win32'
+    const venvBinDir = isWindows ? 'Scripts' : 'bin'
+    const venvPythonName = isWindows ? 'python.exe' : 'python3'
+
     const pythonPath = this.options.venv
-      ? resolve(this.options.venv, 'bin', 'python3')
+      ? resolve(this.options.venv, venvBinDir, venvPythonName)
       : this.options.pythonPath
 
     const bridgeScript = resolve(
@@ -158,7 +264,9 @@ export class PythonBridge {
 
     const env: Record<string, string> = {...process.env as Record<string, string>}
     if (this.options.venv) {
-      env['PATH'] = resolve(this.options.venv, 'bin') + ':' + (env['PATH'] ?? '')
+      // PATH separator: Windows uses ';', Unix uses ':'.
+      const pathSeparator = isWindows ? ';' : ':'
+      env['PATH'] = resolve(this.options.venv, venvBinDir) + pathSeparator + (env['PATH'] ?? '')
       env['VIRTUAL_ENV'] = this.options.venv
     }
 
