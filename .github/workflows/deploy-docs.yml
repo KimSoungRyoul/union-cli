@@ -1,5 +1,9 @@
 name: Deploy Docs to GitHub Pages
 
+# 사전 설정 (1회): Repo Settings → Pages → Build and deployment → Source =
+# "GitHub Actions"로 변경. GITHUB_TOKEN은 Pages 최초 활성화 권한이 없어
+# 워크플로 자체로 활성화 불가능 — 수동 1회 필요.
+
 on:
   push:
     branches: ["main"]
@@ -54,8 +58,6 @@ jobs:
 
       - name: Configure GitHub Pages
         uses: actions/configure-pages@v6
-        with:
-          enablement: true
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v5
