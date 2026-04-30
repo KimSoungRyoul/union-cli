@@ -1,4 +1,5 @@
 import YAML from 'yaml'
+import {writeWithPager, shouldUsePager} from './pager.js'
 
 /**
  * Detect whether color/emoji output should be suppressed.
@@ -110,6 +111,25 @@ export class OutputFormatter {
   print(data: unknown, options: {format: string; quiet: boolean; noColor: boolean}): void {
     if (options.quiet) return
     const output = this.format(data, options.format)
+    console.log(output)
+  }
+
+  /**
+   * print() 의 비동기 변형. table/yaml/line/csv 형식이고 TTY + 긴 출력이면 pager 로 파이프.
+   * JSON 형식은 raw stdout (machine-readable 보존, 파이프/리다이렉트 안전).
+   * --no-pager / NO_PAGER / PAGER='' / non-TTY 시 자동으로 pager 비활성.
+   */
+  async printAsync(
+    data: unknown,
+    options: {format: string; quiet: boolean; noColor: boolean; pager?: boolean},
+  ): Promise<void> {
+    if (options.quiet) return
+    const output = this.format(data, options.format)
+    const pagerEnabled = options.pager !== false && options.format !== 'json'
+    if (pagerEnabled && this.isTTY && shouldUsePager({enabled: true})) {
+      await writeWithPager(output + '\n', {enabled: true})
+      return
+    }
     console.log(output)
   }
 
