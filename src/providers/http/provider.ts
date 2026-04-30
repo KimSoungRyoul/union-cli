@@ -242,6 +242,197 @@ function isJsonContentType(ct: string): boolean {
   return /^\s*(?:application|text)\/(?:[\w.+-]+\+)?json(?:\s*;.*)?$/i.test(ct)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Retry policy
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Internal retry config. The manifest 의 `provider.config.retry` 필드를
+ * 그대로 받지만(현재 schema.ts 가 additionalProperties: true 라 typed 가
+ * 아님), 여기서 NormalizedRetryConfig 로 정규화한 뒤 사용한다.
+ *
+ * 사용자가 어떤 필드도 지정하지 않으면 기본 동작은 "재시도 안 함"이다
+ * (attempts=1) — 기존 동작과 100% 호환.
+ */
+export interface RawRetryConfig {
+  attempts?: number
+  initialDelayMs?: number
+  maxDelayMs?: number
+  retryOn?: number[]
+  respectRetryAfter?: boolean
+  jitter?: 'full' | 'equal' | 'none'
+  /**
+   * - true:  항상 재시도 시도 (POST 포함)
+   * - false: 재시도 안 함 (네트워크 에러도)
+   * - 'auto'(기본): GET/HEAD/PUT/DELETE 만 재시도
+   */
+  idempotent?: boolean | 'auto'
+}
+
+interface NormalizedRetryConfig {
+  attempts: number
+  initialDelayMs: number
+  maxDelayMs: number
+  retryOn: ReadonlySet<number>
+  respectRetryAfter: boolean
+  jitter: 'full' | 'equal' | 'none'
+  idempotent: boolean | 'auto'
+}
+
+const DEFAULT_RETRY_ON = [429, 500, 502, 503, 504]
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'PUT', 'DELETE'])
+
+/**
+ * Manifest 의 retry 섹션(any) 을 안전한 internal 타입으로 정규화.
+ * 잘못된 값/누락된 필드는 합리적 기본값으로 보정. 음수는 0으로 clamp.
+ */
+export function normalizeRetryConfig(raw: unknown): NormalizedRetryConfig {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Partial<RawRetryConfig>
+
+  const attempts = Math.max(1, Math.floor(typeof r.attempts === 'number' ? r.attempts : 1))
+  const initialDelayMs = Math.max(0, Math.floor(typeof r.initialDelayMs === 'number' ? r.initialDelayMs : 200))
+  const maxDelayMs = Math.max(initialDelayMs, Math.floor(typeof r.maxDelayMs === 'number' ? r.maxDelayMs : 5000))
+  const retryOnArr = Array.isArray(r.retryOn) && r.retryOn.length > 0
+    ? r.retryOn.filter((n): n is number => typeof n === 'number' && Number.isInteger(n))
+    : DEFAULT_RETRY_ON
+  const retryOn = new Set<number>(retryOnArr)
+  const respectRetryAfter = r.respectRetryAfter !== false
+  const jitter: 'full' | 'equal' | 'none' =
+    r.jitter === 'none' || r.jitter === 'equal' || r.jitter === 'full' ? r.jitter : 'full'
+  const idempotent: boolean | 'auto' =
+    r.idempotent === true || r.idempotent === false || r.idempotent === 'auto'
+      ? r.idempotent
+      : 'auto'
+
+  return {attempts, initialDelayMs, maxDelayMs, retryOn, respectRetryAfter, jitter, idempotent}
+}
+
+/** retryOn 또는 idempotent 정책에 따라 주어진 메서드가 재시도 대상인지 결정한다. */
+export function isMethodRetryable(method: string, idempotent: boolean | 'auto'): boolean {
+  if (idempotent === false) return false
+  if (idempotent === true) return true
+  return IDEMPOTENT_METHODS.has(method.toUpperCase())
+}
+
+/**
+ * Exponential backoff + jitter.
+ *   delay = min(maxDelayMs, initialDelayMs * 2^(attempt-1))
+ *   - full:  random(0, delay)
+ *   - equal: delay/2 + random(0, delay/2)
+ *   - none:  delay 그대로 (deterministic)
+ */
+export function computeBackoffMs(
+  attempt: number,
+  cfg: Pick<NormalizedRetryConfig, 'initialDelayMs' | 'maxDelayMs' | 'jitter'>,
+  rng: () => number = Math.random,
+): number {
+  const exp = cfg.initialDelayMs * Math.pow(2, Math.max(0, attempt - 1))
+  const base = Math.min(cfg.maxDelayMs, exp)
+  if (cfg.jitter === 'none') return base
+  if (cfg.jitter === 'equal') return base / 2 + rng() * (base / 2)
+  // full
+  return rng() * base
+}
+
+/**
+ * Retry-After 헤더 파싱.
+ *   - 정수(seconds) → ms
+ *   - HTTP-date     → now 와의 차이(ms, 음수면 0)
+ *   - 파싱 실패     → null
+ */
+export function parseRetryAfter(value: string | null, now: number = Date.now()): number | null {
+  if (!value) return null
+  const trimmed = value.trim()
+  if (trimmed.length === 0) return null
+  // 정수 초 (RFC 7231: delay-seconds)
+  if (/^\d+$/.test(trimmed)) {
+    return parseInt(trimmed, 10) * 1000
+  }
+  const dateMs = Date.parse(trimmed)
+  if (!Number.isNaN(dateMs)) {
+    return Math.max(0, dateMs - now)
+  }
+  return null
+}
+
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => {
+    if (ms <= 0) {
+      resolve()
+      return
+    }
+    setTimeout(resolve, ms)
+  })
+
+/**
+ * fetch 를 retry 정책으로 감싼다.
+ *
+ * 발동 조건:
+ *   - response.status ∈ retryOn
+ *   - fetch 자체 실패 (네트워크 에러 / AbortError 포함)
+ *   - 단, 메서드가 idempotent 정책에 부합하지 않으면 재시도하지 않는다.
+ *
+ * 401 은 절대 retry 하지 않는다. (auth-handlers 의 JWT refresh 로직과 충돌 회피)
+ *
+ * 시도 사이 delay = Retry-After 헤더 우선(있으면) 또는 exponential backoff + jitter,
+ * 둘 다 maxDelayMs 로 cap.
+ */
+export async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  retry: NormalizedRetryConfig,
+  method: string,
+  hooks: {
+    sleep?: (ms: number) => Promise<void>
+    rng?: () => number
+    fetchImpl?: typeof fetch
+  } = {},
+): Promise<Response> {
+  const doFetch = hooks.fetchImpl ?? fetch
+  const doSleep = hooks.sleep ?? sleep
+  const rng = hooks.rng ?? Math.random
+  const allowRetry = isMethodRetryable(method, retry.idempotent) && retry.attempts > 1
+
+  let lastError: unknown
+  for (let attempt = 1; attempt <= retry.attempts; attempt++) {
+    try {
+      const response = await doFetch(url, init)
+      // 401 은 retry 정책 미적용 (auth-handlers 가 처리).
+      if (response.status === 401) return response
+      // 성공 또는 retryOn 에 없는 status → 그대로 반환
+      if (!retry.retryOn.has(response.status)) return response
+      // retryOn 매칭 → idempotent 가 아니거나 마지막 시도면 그대로 반환
+      if (!allowRetry || attempt === retry.attempts) return response
+      // 재시도 대기
+      const retryAfterMs = retry.respectRetryAfter
+        ? parseRetryAfter(response.headers.get('Retry-After'))
+        : null
+      const baseDelay = retryAfterMs ?? computeBackoffMs(attempt, retry, rng)
+      const delay = Math.min(retry.maxDelayMs, Math.max(0, baseDelay))
+      // 응답 본문이 stream 이라면 release (caller 가 buffer 안 했을 수 있으므로).
+      try {
+        if (typeof response.body?.cancel === 'function') {
+          await response.body.cancel()
+        }
+      } catch {
+        /* noop */
+      }
+      await doSleep(delay)
+      continue
+    } catch (err) {
+      lastError = err
+      if (!allowRetry || attempt === retry.attempts) {
+        throw err
+      }
+      const delay = Math.min(retry.maxDelayMs, computeBackoffMs(attempt, retry, rng))
+      await doSleep(delay)
+      continue
+    }
+  }
+  // 이론상 도달 불가 (위 루프에서 항상 return 또는 throw).
+  throw lastError ?? new Error('fetchWithRetry: exhausted without response')
+}
+
 export class HTTPProvider implements IProvider {
   readonly type = 'http' as const
   private config: HttpProviderConfig
@@ -452,14 +643,28 @@ export class HTTPProvider implements IProvider {
     let finalHeaders = stripEmptyHeaders(headers)
     finalHeaders = applyAuth(finalHeaders, this.config.auth, credentials)
 
-    // 6. Execute fetch
+    // 6. Execute fetch (with retry policy if configured)
+    const retryRaw = (this.config as unknown as {retry?: unknown}).retry
+    const retryConfig = normalizeRetryConfig(retryRaw)
+    const timeoutMs = this.config.timeout ?? 30000
+    // init 에는 signal 을 넣지 않는다. AbortSignal 은 한 번 abort 되면 재사용이
+    // 불가능하므로, fetchImpl wrapper 에서 매 시도마다 fresh signal 을 주입한다.
+    const init: RequestInit = {
+      method: httpConfig.method,
+      headers: finalHeaders,
+      body: body ? JSON.stringify(body) : undefined,
+    }
     try {
-      const response = await fetch(url, {
-        method: httpConfig.method,
-        headers: finalHeaders,
-        body: body ? JSON.stringify(body) : undefined,
-        signal: AbortSignal.timeout(this.config.timeout ?? 30000),
-      })
+      const response = await fetchWithRetry(
+        url,
+        init,
+        retryConfig,
+        httpConfig.method,
+        {
+          // 매 시도마다 fresh timeout signal 을 부여한다.
+          fetchImpl: (u, i) => fetch(u, {...i, signal: AbortSignal.timeout(timeoutMs)}),
+        },
+      )
 
       let data: unknown
       const contentType = response.headers.get('content-type') ?? ''
