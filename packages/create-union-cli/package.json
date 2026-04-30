@@ -1,0 +1,24 @@
+{
+  "name": "create-union-cli",
+  "version": "0.1.0",
+  "description": "Create a new union-cli project",
+  "type": "module",
+  "bin": {
+    "create-union-cli": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md"
+  ],
+  "keywords": [
+    "union-cli",
+    "cli",
+    "scaffold",
+    "create",
+    "yaml"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}

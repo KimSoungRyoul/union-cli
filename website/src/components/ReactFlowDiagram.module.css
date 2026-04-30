@@ -1,0 +1,14 @@
+.container {
+  width: 100%;
+  height: 500px;
+  border: 1px solid var(--ifm-color-emphasis-200);
+  border-radius: 12px;
+  overflow: hidden;
+  margin: 1.5rem 0;
+  background: var(--ifm-background-surface-color, #fafafa);
+}
+
+[data-theme='dark'] .container {
+  border-color: var(--ifm-color-emphasis-300);
+  background: #16162a;
+}
