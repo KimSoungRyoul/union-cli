@@ -6,6 +6,11 @@ import {
   buildHeaders,
   coerceBodyValue,
   resolveEndpointUrl,
+  normalizeRetryConfig,
+  computeBackoffMs,
+  parseRetryAfter,
+  isMethodRetryable,
+  fetchWithRetry,
 } from '../src/providers/http/provider.js'
 import {applyAuth} from '../src/providers/http/auth-handlers.js'
 import {logger} from '../src/core/logger.js'
@@ -671,5 +676,406 @@ describe('applyAuth — 빈 토큰/credential은 Authorization 헤더를 생성�
     const result = applyAuth({}, {type: 'basic'}, {username: 'u', password: ''})
     expect(result.Authorization).toBeUndefined()
     errorSpy.mockRestore()
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Retry policy
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('normalizeRetryConfig', () => {
+  it('빈/undefined 입력은 attempts=1 (기본 no-retry) 로 정규화된다', () => {
+    const cfg = normalizeRetryConfig(undefined)
+    expect(cfg.attempts).toBe(1)
+    expect(cfg.initialDelayMs).toBe(200)
+    expect(cfg.maxDelayMs).toBe(5000)
+    expect(cfg.respectRetryAfter).toBe(true)
+    expect(cfg.jitter).toBe('full')
+    expect(cfg.idempotent).toBe('auto')
+    expect([...cfg.retryOn]).toEqual([429, 500, 502, 503, 504])
+  })
+
+  it('전체 필드가 있는 경우 그대로 사용한다', () => {
+    const cfg = normalizeRetryConfig({
+      attempts: 5,
+      initialDelayMs: 100,
+      maxDelayMs: 1000,
+      retryOn: [503, 504],
+      respectRetryAfter: false,
+      jitter: 'none',
+      idempotent: true,
+    })
+    expect(cfg.attempts).toBe(5)
+    expect(cfg.initialDelayMs).toBe(100)
+    expect(cfg.maxDelayMs).toBe(1000)
+    expect([...cfg.retryOn].sort()).toEqual([503, 504])
+    expect(cfg.respectRetryAfter).toBe(false)
+    expect(cfg.jitter).toBe('none')
+    expect(cfg.idempotent).toBe(true)
+  })
+
+  it('attempts < 1 은 1로 보정된다', () => {
+    const cfg = normalizeRetryConfig({attempts: 0})
+    expect(cfg.attempts).toBe(1)
+  })
+
+  it('maxDelayMs < initialDelayMs 면 initialDelayMs 로 보정된다', () => {
+    const cfg = normalizeRetryConfig({initialDelayMs: 1000, maxDelayMs: 100})
+    expect(cfg.maxDelayMs).toBe(1000)
+  })
+
+  it('잘못된 jitter 값은 full 로 폴백한다', () => {
+    // 사용자가 'random' 같은 잘못된 enum 을 줬을 때 — 정규화는 안전한 기본값으로
+    const cfg = normalizeRetryConfig({jitter: 'random' as 'full'})
+    expect(cfg.jitter).toBe('full')
+  })
+
+  it('빈 retryOn 배열은 default 로 폴백한다', () => {
+    const cfg = normalizeRetryConfig({retryOn: []})
+    expect([...cfg.retryOn].sort((a, b) => a - b)).toEqual([429, 500, 502, 503, 504])
+  })
+})
+
+describe('parseRetryAfter', () => {
+  it('정수(seconds) 헤더를 ms 로 변환한다', () => {
+    expect(parseRetryAfter('1')).toBe(1000)
+    expect(parseRetryAfter('30')).toBe(30000)
+  })
+
+  it('HTTP-date 형식을 미래 시점까지의 ms 로 변환한다', () => {
+    const now = Date.now()
+    const future = new Date(now + 5000).toUTCString()
+    const result = parseRetryAfter(future, now)
+    // toUTCString 의 초 단위 반올림 때문에 약간의 오차 허용
+    expect(result).not.toBeNull()
+    expect(result!).toBeGreaterThanOrEqual(0)
+    expect(result!).toBeLessThanOrEqual(5000)
+  })
+
+  it('과거 시점은 0으로 clamp 된다', () => {
+    const now = Date.now()
+    const past = new Date(now - 5000).toUTCString()
+    expect(parseRetryAfter(past, now)).toBe(0)
+  })
+
+  it('null/빈/잘못된 값은 null 을 반환한다', () => {
+    expect(parseRetryAfter(null)).toBeNull()
+    expect(parseRetryAfter('')).toBeNull()
+    expect(parseRetryAfter('   ')).toBeNull()
+    expect(parseRetryAfter('not-a-date')).toBeNull()
+  })
+})
+
+describe('computeBackoffMs', () => {
+  it('jitter=none 이면 deterministic 한 exponential 값을 반환한다', () => {
+    const cfg = {initialDelayMs: 100, maxDelayMs: 5000, jitter: 'none' as const}
+    expect(computeBackoffMs(1, cfg)).toBe(100)
+    expect(computeBackoffMs(2, cfg)).toBe(200)
+    expect(computeBackoffMs(3, cfg)).toBe(400)
+    expect(computeBackoffMs(4, cfg)).toBe(800)
+  })
+
+  it('maxDelayMs 로 cap 된다', () => {
+    const cfg = {initialDelayMs: 100, maxDelayMs: 300, jitter: 'none' as const}
+    // 100 * 2^3 = 800 → 300 cap
+    expect(computeBackoffMs(4, cfg)).toBe(300)
+    expect(computeBackoffMs(10, cfg)).toBe(300)
+  })
+
+  it('jitter=full 이면 0 ~ delay 범위에서 무작위', () => {
+    const cfg = {initialDelayMs: 100, maxDelayMs: 5000, jitter: 'full' as const}
+    // rng=0 → 0, rng=0.999 → near 200
+    expect(computeBackoffMs(2, cfg, () => 0)).toBe(0)
+    expect(computeBackoffMs(2, cfg, () => 0.5)).toBe(100)
+  })
+
+  it('jitter=equal 이면 delay/2 ~ delay 범위', () => {
+    const cfg = {initialDelayMs: 100, maxDelayMs: 5000, jitter: 'equal' as const}
+    expect(computeBackoffMs(2, cfg, () => 0)).toBe(100)   // 200/2 + 0
+    expect(computeBackoffMs(2, cfg, () => 1)).toBe(200)   // 200/2 + 200/2
+  })
+})
+
+describe('isMethodRetryable', () => {
+  it('idempotent=false 면 모든 메서드를 거부한다', () => {
+    expect(isMethodRetryable('GET', false)).toBe(false)
+    expect(isMethodRetryable('POST', false)).toBe(false)
+  })
+
+  it('idempotent=true 면 모든 메서드를 허용한다', () => {
+    expect(isMethodRetryable('GET', true)).toBe(true)
+    expect(isMethodRetryable('POST', true)).toBe(true)
+  })
+
+  it('idempotent=auto 면 GET/HEAD/PUT/DELETE 만 허용한다', () => {
+    expect(isMethodRetryable('GET', 'auto')).toBe(true)
+    expect(isMethodRetryable('HEAD', 'auto')).toBe(true)
+    expect(isMethodRetryable('PUT', 'auto')).toBe(true)
+    expect(isMethodRetryable('DELETE', 'auto')).toBe(true)
+    expect(isMethodRetryable('POST', 'auto')).toBe(false)
+    expect(isMethodRetryable('PATCH', 'auto')).toBe(false)
+  })
+
+  it('소문자 메서드도 정확히 매칭한다', () => {
+    expect(isMethodRetryable('get', 'auto')).toBe(true)
+    expect(isMethodRetryable('post', 'auto')).toBe(false)
+  })
+})
+
+// ── fetchWithRetry: 시나리오 ──
+
+function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}): Response {
+  return new Response(typeof body === 'string' ? body : JSON.stringify(body), {
+    status,
+    headers: {'Content-Type': 'application/json', ...headers},
+  })
+}
+
+describe('fetchWithRetry', () => {
+  it('case 1: 503 → 200 — attempts=3, retryOn=[503] 이면 1회 재시도 후 성공한다', async () => {
+    const calls: number[] = []
+    const fakeFetch = vi.fn(async () => {
+      calls.push(Date.now())
+      if (calls.length === 1) return jsonResponse(503, {error: 'unavailable'})
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], jitter: 'none', initialDelayMs: 1})
+    const sleeps: number[] = []
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(res.status).toBe(200)
+    expect(fakeFetch).toHaveBeenCalledTimes(2)
+    expect(sleeps).toHaveLength(1)
+  })
+
+  it('case 2: 모든 attempts 가 503 이면 마지막 응답을 반환한다 (호출자가 HTTP_503 처리)', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(503, {error: 'down'}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], jitter: 'none', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(503)
+    expect(fakeFetch).toHaveBeenCalledTimes(3)
+  })
+
+  it('case 3: Retry-After (seconds) 헤더가 backoff 보다 우선 적용된다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) {
+        return jsonResponse(429, {error: 'too many'}, {'Retry-After': '2'})
+      }
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({
+      attempts: 3,
+      retryOn: [429],
+      jitter: 'none',
+      initialDelayMs: 50,
+      maxDelayMs: 5000,
+      respectRetryAfter: true,
+    })
+    const sleeps: number[] = []
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(res.status).toBe(200)
+    // Retry-After: 2 → 2000ms (initialDelayMs=50 인 backoff 와는 다름)
+    expect(sleeps).toEqual([2000])
+  })
+
+  it('case 3b: respectRetryAfter=false 면 헤더 무시하고 backoff 만 사용한다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) {
+        return jsonResponse(429, {error: 'too many'}, {'Retry-After': '5'})
+      }
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({
+      attempts: 3,
+      retryOn: [429],
+      jitter: 'none',
+      initialDelayMs: 100,
+      respectRetryAfter: false,
+    })
+    const sleeps: number[] = []
+    await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(sleeps).toEqual([100])
+  })
+
+  it('case 4: 네트워크 에러 (fetch reject) 도 retry 한다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) throw new Error('network failure')
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, jitter: 'none', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(200)
+    expect(fakeFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('case 4b: AbortError 도 동일하게 retry 된다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) {
+        const err = new Error('aborted')
+        err.name = 'AbortError'
+        throw err
+      }
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, jitter: 'none', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(200)
+  })
+
+  it('case 4c: 모든 attempts 가 네트워크 에러면 최종 throw 한다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      throw new Error('net down')
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, jitter: 'none', initialDelayMs: 1})
+    await expect(
+      fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+        fetchImpl: fakeFetch as unknown as typeof fetch,
+        sleep: async () => {},
+      }),
+    ).rejects.toThrow('net down')
+    expect(fakeFetch).toHaveBeenCalledTimes(3)
+  })
+
+  it('case 5: idempotent=false 면 POST 도 retry 안 한다', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(503, {}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], idempotent: false, initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'POST', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(503)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('case 6a: idempotent=auto + GET 은 retry 한다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) return jsonResponse(503, {})
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], idempotent: 'auto', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(200)
+    expect(fakeFetch).toHaveBeenCalledTimes(2)
+  })
+
+  it('case 6b: idempotent=auto + POST 는 retry 안 한다', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(503, {}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], idempotent: 'auto', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'POST', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(503)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('case 7: retry config 미지정 시 default attempts=1 — 한 번만 호출하고 반환', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(503, {}))
+    const cfg = normalizeRetryConfig(undefined) // attempts=1
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(503)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('case 8: jitter=none + initialDelayMs=100 일 때 정확히 100, 200, 400 ms 슬립한다', async () => {
+    let attempts = 0
+    const fakeFetch = vi.fn(async () => {
+      attempts++
+      if (attempts < 4) return jsonResponse(503, {})
+      return jsonResponse(200, {ok: true})
+    })
+    const cfg = normalizeRetryConfig({
+      attempts: 4,
+      retryOn: [503],
+      jitter: 'none',
+      initialDelayMs: 100,
+      maxDelayMs: 5000,
+    })
+    const sleeps: number[] = []
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(res.status).toBe(200)
+    // attempt 1 fail → backoff(1)=100, attempt 2 fail → backoff(2)=200, attempt 3 fail → backoff(3)=400
+    expect(sleeps).toEqual([100, 200, 400])
+  })
+
+  it('401 응답은 retry 정책 미적용 — 즉시 반환된다 (auth-handlers 영역)', async () => {
+    // retryOn 에 401 을 명시적으로 추가했더라도 retry 하지 않는다.
+    const fakeFetch = vi.fn(async () => jsonResponse(401, {error: 'unauthorized'}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [401, 503], jitter: 'none', initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(401)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('retryOn 에 없는 status (예: 400) 는 즉시 반환', async () => {
+    const fakeFetch = vi.fn(async () => jsonResponse(400, {error: 'bad request'}))
+    const cfg = normalizeRetryConfig({attempts: 3, retryOn: [503], initialDelayMs: 1})
+    const res = await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async () => {},
+    })
+    expect(res.status).toBe(400)
+    expect(fakeFetch).toHaveBeenCalledTimes(1)
+  })
+
+  it('Retry-After 가 maxDelayMs 보다 크면 cap 된다', async () => {
+    const fakeFetch = vi.fn(async () => {
+      if (fakeFetch.mock.calls.length === 1) {
+        return jsonResponse(429, {}, {'Retry-After': '100'}) // 100s = 100000ms
+      }
+      return jsonResponse(200, {})
+    })
+    const cfg = normalizeRetryConfig({
+      attempts: 3,
+      retryOn: [429],
+      jitter: 'none',
+      initialDelayMs: 50,
+      maxDelayMs: 1000,
+    })
+    const sleeps: number[] = []
+    await fetchWithRetry('http://x/y', {}, cfg, 'GET', {
+      fetchImpl: fakeFetch as unknown as typeof fetch,
+      sleep: async (ms) => {
+        sleeps.push(ms)
+      },
+    })
+    expect(sleeps).toEqual([1000])
   })
 })
