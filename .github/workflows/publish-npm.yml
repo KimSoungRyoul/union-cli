@@ -10,18 +10,20 @@ on:
         required: true
 
 # npm Trusted Publishing (OIDC)
-#  사전 설정 필요 (1회):
-#    1. https://www.npmjs.com/package/union-cli/access  (또는 first publish 후)
-#    2. "Trusted Publisher" 추가 → GitHub Actions 선택
+#  - npm CLI 11.5.1+ & Node 22.14.0+ 필요 (setup-node@v6 + node 22로 충족)
+#  - --provenance 플래그 불필요: trusted publishing이면 npm이 자동 첨부
+#  - id-token: write 권한이 OIDC 토큰 발급을 허용
+#
+#  사전 설정 (1회):
+#    1. 최초 publish는 trusted publisher 등록 전이므로 로컬에서
+#       `npm publish --access public` 1회 실행 (시드 publish)
+#    2. https://www.npmjs.com/package/<pkg>/access 에서
+#       "Trusted Publisher" 추가 → GitHub Actions 선택
 #       - Organization or user: KimSoungRyoul
 #       - Repository: union-cli
 #       - Workflow filename: publish-npm.yml
 #       - Environment name: (비워둠)
 #    3. create-union-cli 패키지에도 동일하게 등록
-#
-#  최초 publish 시점에는 trusted publisher 등록 전이므로
-#  1회만 로컬에서 `npm publish --access public`로 시드 publish 후
-#  위 절차를 진행한다.
 
 permissions:
   contents: read
@@ -35,10 +37,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Setup Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@v6
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
@@ -64,9 +66,9 @@ jobs:
       - name: Build
         run: npm run build
 
-      - name: Publish union-cli (OIDC + provenance)
-        run: npm publish --access public --provenance
+      - name: Publish union-cli (OIDC, provenance auto-attached)
+        run: npm publish --access public
 
-      - name: Publish create-union-cli (OIDC + provenance)
+      - name: Publish create-union-cli (OIDC, provenance auto-attached)
         working-directory: packages/create-union-cli
-        run: npm publish --access public --provenance
+        run: npm publish --access public
