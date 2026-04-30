@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tgz
+.union-cli/
+*.tsbuildinfo
+.idea/
+.claude/
