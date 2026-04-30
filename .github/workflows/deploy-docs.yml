@@ -15,6 +15,9 @@ permissions:
   pages: write
   id-token: write
 
+env:
+  HUSKY: 0
+
 concurrency:
   group: "pages"
   cancel-in-progress: false
