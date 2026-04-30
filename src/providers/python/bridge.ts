@@ -241,8 +241,13 @@ export class PythonBridge {
       return this.process
     }
 
+    // Windows uses Scripts/python.exe; Unix uses bin/python3.
+    const isWindows = process.platform === 'win32'
+    const venvBinDir = isWindows ? 'Scripts' : 'bin'
+    const venvPythonName = isWindows ? 'python.exe' : 'python3'
+
     const pythonPath = this.options.venv
-      ? resolve(this.options.venv, 'bin', 'python3')
+      ? resolve(this.options.venv, venvBinDir, venvPythonName)
       : this.options.pythonPath
 
     const bridgeScript = resolve(
@@ -259,7 +264,9 @@ export class PythonBridge {
 
     const env: Record<string, string> = {...process.env as Record<string, string>}
     if (this.options.venv) {
-      env['PATH'] = resolve(this.options.venv, 'bin') + ':' + (env['PATH'] ?? '')
+      // PATH separator: Windows uses ';', Unix uses ':'.
+      const pathSeparator = isWindows ? ';' : ':'
+      env['PATH'] = resolve(this.options.venv, venvBinDir) + pathSeparator + (env['PATH'] ?? '')
       env['VIRTUAL_ENV'] = this.options.venv
     }
 
