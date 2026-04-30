@@ -1,0 +1,29 @@
+# cli-wrap example expected outputs
+# (실제 출력은 현재 git 저장소 상태에 따라 다릅니다 — 아래는 형식 예시)
+
+# `gw git status show --json`
+# outputParser: lines → 줄바꿈 분리된 string[] 로 반환
+[
+  " M README.md",
+  "?? new-file.txt"
+]
+
+# `gw git log recent 3 --json`
+[
+  "9cdc67a fix(docs): drop enablement: true (GITHUB_TOKEN cannot create Pages site)",
+  "39a409d fix(docs): bump pages actions to latest (Node 24) + enablement: true",
+  "f7c46e5 fix(docs): upgrade Docusaurus 3.7 -> 3.10 + pin webpack <5.106 (npm overrides)"
+]
+
+# `gw git diff stat --json`
+[
+  " src/index.ts | 4 ++--",
+  " 1 file changed, 2 insertions(+), 2 deletions(-)"
+]
+
+# `gw git branch list --all --json`
+[
+  "* main",
+  "  remotes/origin/HEAD -> origin/main",
+  "  remotes/origin/main"
+]
