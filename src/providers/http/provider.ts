@@ -14,6 +14,7 @@ import {applyAuth} from './auth-handlers.js'
 import {resolveSecret, EnvCredentialStore} from '../../core/credential-store.js'
 import {logger} from '../../core/logger.js'
 import {AuthManager} from '../../core/auth.js'
+import {readProxyEnv, createDispatcher} from '../../core/proxy-utils.js'
 
 /**
  * Replace {param} placeholders in a path template with values from args.
@@ -737,11 +738,31 @@ export class HTTPProvider implements IProvider {
   private config: HttpProviderConfig
   private namespace: string
   private authManager: AuthManager
+  private dispatcherCache = new Map<string, unknown>()
+  private proxyConfig = readProxyEnv()
 
   constructor(config: HttpProviderConfig, namespace: string, authManager?: AuthManager) {
     this.config = config
     this.namespace = namespace
     this.authManager = authManager ?? new AuthManager(new EnvCredentialStore())
+  }
+
+  /**
+   * URL 의 host 기준으로 dispatcher 를 캐싱한다 (TLS handshake 재사용).
+   * proxy 가 설정되지 않은 host 는 cache 에 undefined 저장.
+   */
+  private async getDispatcher(targetUrl: string | URL | Request): Promise<unknown | undefined> {
+    const urlStr = typeof targetUrl === 'string' ? targetUrl : targetUrl instanceof URL ? targetUrl.toString() : targetUrl.url
+    let host: string
+    try {
+      host = new URL(urlStr).host
+    } catch {
+      return undefined
+    }
+    if (this.dispatcherCache.has(host)) return this.dispatcherCache.get(host)
+    const dispatcher = await createDispatcher(urlStr, this.proxyConfig)
+    this.dispatcherCache.set(host, dispatcher ?? undefined)
+    return dispatcher ?? undefined
   }
 
   resolveCommands(_manifest: PluginManifest): CommandSpec[] {
@@ -959,7 +980,15 @@ export class HTTPProvider implements IProvider {
 
     const fetchWithRetryFn = (u: string, i: RequestInit): Promise<Response> =>
       fetchWithRetry(u, i, retryConfig, httpConfig.method, {
-        fetchImpl: (uu, ii) => fetch(uu, {...ii, signal: AbortSignal.timeout(timeoutMs)}),
+        fetchImpl: async (uu, ii) => {
+          const dispatcher = await this.getDispatcher(uu)
+          const init: RequestInit & {dispatcher?: unknown} = {
+            ...ii,
+            signal: AbortSignal.timeout(timeoutMs),
+          }
+          if (dispatcher) init.dispatcher = dispatcher
+          return fetch(uu, init)
+        },
       })
 
     const pagRaw = (this.config as unknown as Record<string, unknown>).pagination
@@ -1051,11 +1080,14 @@ export class HTTPProvider implements IProvider {
         // auth 해석 실패: 헤더 없이 단순 reachability만 확인
       }
 
-      const response = await fetch(this.config.baseUrl, {
+      const dispatcher = await this.getDispatcher(this.config.baseUrl)
+      const init: RequestInit & {dispatcher?: unknown} = {
         method: 'GET',
         headers: authHeaders,
         signal: AbortSignal.timeout(5000),
-      })
+      }
+      if (dispatcher) init.dispatcher = dispatcher
+      const response = await fetch(this.config.baseUrl, init)
 
       // 401/403은 "네트워크로는 도달 가능"을 의미하지만 건강한 상태는 아니다.
       const authProblem = response.status === 401 || response.status === 403

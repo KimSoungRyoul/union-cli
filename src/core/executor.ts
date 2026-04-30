@@ -5,6 +5,7 @@ import type {
   PluginManifest,
 } from './types.js'
 import {CommandRegistry} from './registry.js'
+import {AuditLogger, isAuditDisabled} from './audit-log.js'
 
 /**
  * Manifest 와 Provider 인스턴스를 묶어 실제 명령 실행을 수행하는 오케스트레이터.
@@ -14,9 +15,19 @@ import {CommandRegistry} from './registry.js'
  * 로 등록된다. Runtime 에서는 oclif 가 생성한 BaseCommand 가 `execute(specId, input)`
  * 를 호출해 결과(`ExecutionResult`)를 받아 출력 포매팅에 사용한다.
  */
+export interface ExecutorOptions {
+  /** 명령 호출 기록을 받을 AuditLogger. 미주입 시 audit 비활성. */
+  auditLogger?: AuditLogger | null
+}
+
 export class Executor {
   private providers = new Map<string, IProvider>()
   readonly registry = new CommandRegistry()
+  private auditLogger: AuditLogger | null
+
+  constructor(opts: ExecutorOptions = {}) {
+    this.auditLogger = opts.auditLogger ?? null
+  }
 
   /**
    * namespace 에 해당하는 Provider 인스턴스를 등록한다.
@@ -92,13 +103,15 @@ export class Executor {
 
     try {
       const result = await provider.execute(spec, input)
-      return {
+      const finalResult: ExecutionResult = {
         ...result,
         duration: performance.now() - startTime,
       }
+      this.recordAudit(spec.namespace, spec.id, finalResult, input)
+      return finalResult
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error)
-      return {
+      const finalResult: ExecutionResult = {
         success: false,
         data: null,
         exitCode: 1,
@@ -109,6 +122,33 @@ export class Executor {
           details: error instanceof Error ? error.stack : undefined,
         },
       }
+      this.recordAudit(spec.namespace, spec.id, finalResult, input)
+      return finalResult
     }
+  }
+
+  /**
+   * AuditLogger 가 주입되어 있고 NO_AUDIT/--audit-off 가 아닐 때 호출 기록.
+   * 실패 시 silently 무시 — audit 실패가 명령 실행을 막아서는 안 된다.
+   */
+  private recordAudit(
+    namespace: string,
+    command: string,
+    result: ExecutionResult,
+    input: ExecutionInput,
+  ): void {
+    if (!this.auditLogger || isAuditDisabled()) return
+    void this.auditLogger
+      .record({
+        namespace,
+        command,
+        exitCode: result.exitCode,
+        duration: result.duration,
+        flags: input.flags as Record<string, unknown>,
+        error: result.error?.message,
+      })
+      .catch(() => {
+        // audit failure must not break command execution
+      })
   }
 }
