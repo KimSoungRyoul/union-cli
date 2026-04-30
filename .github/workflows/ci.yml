@@ -31,10 +31,13 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: ${{ matrix.node-version }}
-          cache: "npm"
 
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
+      - name: Show npm/node version
+        run: node --version && npm --version
+
+      - name: Install dependencies (verbose)
+        run: npm ci --ignore-scripts --no-audit --no-fund --prefer-offline=false 2>&1 | tail -50
+        timeout-minutes: 5
 
       - name: Lint
         run: npm run lint
