@@ -38,18 +38,15 @@ jobs:
             package-lock.json
             website/package-lock.json
 
-      - name: Upgrade npm
-        run: npm install -g npm@latest
-
       - name: Install root dependencies
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build union-cli
         run: npm run build
 
       - name: Install website dependencies
         working-directory: website
-        run: npm ci
+        run: npm ci --ignore-scripts
 
       - name: Build Docusaurus
         working-directory: website
