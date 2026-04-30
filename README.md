@@ -164,6 +164,32 @@ my-cli api users list --quiet            # 출력 없음 (exit code만)
 
 ---
 
+## Examples
+
+각 Provider 별 동작하는 샘플 프로젝트:
+
+- [http-jsonplaceholder](./examples/http-jsonplaceholder) — HTTP provider, JSONPlaceholder REST API
+- [cli-wrap](./examples/cli-wrap) — CLI provider, git command wrapping
+- [python-sdk](./examples/python-sdk) — Python provider, numpy stats via JSON-RPC
+- [js-module](./examples/js-module) — JS provider, local ESM functions in-process
+
+---
+
+## Shell Completion
+
+zsh / bash / fish 자동완성을 설치하려면:
+
+```bash
+my-cli completion install              # SHELL 환경변수로 자동 감지
+my-cli completion install zsh          # 명시적
+my-cli completion install bash --apply # ~/.bashrc 직접 수정 (위험)
+my-cli completion install fish --dry-run --apply
+```
+
+`--apply` 없이는 안내 + 스크립트만 stdout 으로 출력합니다 (안전 기본값).
+
+---
+
 ## 관련 문서
 
 - [Architecture (Docs)](https://kimsoungryoul.github.io/union-cli/) — 5-Layer 아키텍처 + 실행 흐름
