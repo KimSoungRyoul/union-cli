@@ -2,9 +2,7 @@ import {describe, it, expect, vi, beforeEach} from 'vitest'
 import {Executor} from '../src/core/executor.js'
 import type {
   IProvider,
-  CommandSpec,
   ExecutionInput,
-  ExecutionResult,
   PluginManifest,
 } from '../src/core/types.js'
 
@@ -194,7 +192,7 @@ describe('Executor', () => {
     it('provider.execute()가 비-Error 객체를 던져도 에러 결과를 반환한다', async () => {
       const provider = makeProvider({
         execute: vi.fn(async () => {
-          throw 'string error'  // eslint-disable-line no-throw-literal
+          throw 'string error'   
         }),
       })
 
