@@ -1,5 +1,7 @@
 # union-cli
 
+> [English](./README.en.md) | 한국어
+
 > YAML 선언으로 통합 CLI 생성하는 프레임워크
 
 ---
@@ -222,9 +224,20 @@ npm test              # 전체 (unit + e2e)
 npm run test:unit     # unit 만 (빠름)
 npm run test:e2e      # e2e 만 (./bin/dev.js 통합 검증)
 npm run test:coverage # 커버리지 포함
+npm run format        # prettier 자동 포맷
+npm run format:check  # CI 용 포맷 검증
 ```
 
 E2E 는 `./bin/dev.js` (tsx) 를 사용해 `npm run build` 의존성 없이 실행됩니다.
+
+## 추가 기능
+
+| 기능 | 설명 | 비활성화 |
+|------|------|---------|
+| **Pager** | TTY + 긴 출력 시 `less -R` (또는 `$PAGER`) 자동 적용 | `NO_PAGER=1`, `PAGER=''` |
+| **Did-you-mean** | 알 수 없는 명령 입력 시 Levenshtein 거리 기반 후보 제안 (정적 + 동적 namespace) | — |
+| **Proxy** | `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` env 자동 인식 (undici ProxyAgent) | env 미설정 |
+| **Audit log** | `~/.<cli-name>/audit.log` 에 호출 기록 (JSONL, chmod 0600, 민감 flag 마스킹) | `NO_AUDIT=1`, `--audit-off` |
 
 ---
 

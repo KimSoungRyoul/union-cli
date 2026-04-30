@@ -23,6 +23,8 @@
     "test:coverage": "vitest run --coverage",
     "test:unit": "vitest run --exclude 'test/e2e/**'",
     "test:e2e": "vitest run test/e2e/",
+    "format": "prettier --write src/ test/",
+    "format:check": "prettier --check src/ test/",
     "lint": "eslint src/ test/",
     "lint:types": "tsc --noEmit",
     "postpack": "rm -f oclif.manifest.json",
@@ -37,12 +39,12 @@
       "target": "./dist/commands"
     },
     "hooks": {
-      "init": "./dist/hooks/init.js"
+      "init": "./dist/hooks/init.js",
+      "command_not_found": "./dist/hooks/command-not-found.js"
     },
     "plugins": [
       "@oclif/plugin-help",
-      "@oclif/plugin-version",
-      "@oclif/plugin-not-found"
+      "@oclif/plugin-version"
     ],
     "topicSeparator": " ",
     "topics": {
@@ -63,9 +65,9 @@
   "dependencies": {
     "@oclif/core": "^4.2.8",
     "@oclif/plugin-help": "^6.2.27",
-    "@oclif/plugin-not-found": "^3.2.80",
     "@oclif/plugin-version": "^2.2.41",
     "ajv": "^8.17.1",
+    "undici": "^6.21.0",
     "yaml": "^2.7.1"
   },
   "devDependencies": {
@@ -76,6 +78,7 @@
     "husky": "^9.1.7",
     "lint-staged": "^16.4.0",
     "oclif": "^4.17.38",
+    "prettier": "^3.4.2",
     "tsx": "^4.19.4",
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.58.0",
