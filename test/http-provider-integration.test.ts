@@ -230,14 +230,16 @@ describe('HTTPProvider.execute — 통합', () => {
     expect(capture.headers?.['authorization']).toBe('Bearer health-token')
   })
 
-  it('healthcheck가 401을 받으면 healthy=false + authentication required 메시지', async () => {
+  it('healthcheck가 401을 받으면 healthy=true (reachable) + authentication required 메시지', async () => {
+    // 의미상 401 은 백엔드가 살아있다는 증거. healthy=reachable=true 로 분류하고
+    // message 에서 auth 문제임을 분명히 한다 (도달성과 인증 상태 분리).
     const provider = new HTTPProvider({baseUrl, auth: {type: 'none'}}, 'test-health-401')
     handler = (_req, res) => {
       res.writeHead(401)
       res.end()
     }
     const result = await provider.healthCheck()
-    expect(result.healthy).toBe(false)
+    expect(result.healthy).toBe(true)
     expect(result.message).toContain('authentication required')
   })
 

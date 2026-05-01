@@ -42,7 +42,7 @@ export async function discoverManifests(options: DiscoveryOptions = {}): Promise
 
 function findYamlFiles(dir: string): string[] {
   return readdirSync(dir)
-    .filter((f) => f.endsWith('.yaml') || f.endsWith('.yml'))
+    .filter((f) => (f.endsWith('.yaml') || f.endsWith('.yml')) && !f.startsWith('_'))
     .sort()
     .map((f) => join(dir, f))
 }

@@ -1,5 +1,5 @@
 /**
- * mTLS / 사내 PKI 환경을 위한 TLS 옵션 helper.
+ * mTLS / private PKI 환경을 위한 TLS 옵션 helper.
  *
  * manifest 의 `provider.config.tls` 에 caFile/certFile/keyFile/rejectUnauthorized 를
  * 선언하면, undici Agent 의 connect 옵션으로 변환해 fetch 의 dispatcher 로 주입한다.
@@ -104,7 +104,7 @@ function readPemFile(path: string, fieldName: string): string {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code
     const reason = code === 'ENOENT' ? 'not found' : code === 'EACCES' ? 'permission denied' : (err as Error).message
-    throw new Error(`tls.${fieldName}: failed to read "${path}" (${reason})`)
+    throw new Error(`tls.${fieldName}: failed to read "${path}" (${reason})`, {cause: err})
   }
 }
 

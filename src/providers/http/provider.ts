@@ -15,6 +15,7 @@ import {resolveSecret, EnvCredentialStore} from '../../core/credential-store.js'
 import {logger} from '../../core/logger.js'
 import {AuthManager} from '../../core/auth.js'
 import {readProxyEnv, createDispatcher} from '../../core/proxy-utils.js'
+import {readTlsConfig, createTlsDispatcher} from '../../core/tls-utils.js'
 
 /**
  * Replace {param} placeholders in a path template with values from args.
@@ -113,8 +114,9 @@ export function coerceBodyValue(value: unknown, bodyType?: string): unknown {
       return JSON.parse(value)
     } catch {
       const preview = value.length > 80 ? value.slice(0, 80) + '...' : value
-      logger.warn(
-        `Warning: httpBodyType=json but value is not valid JSON: "${preview}" — passing as raw string.`,
+      // logger.warn 은 default level 보다 낮을 수 있어 사용자에게 안 보임 → stderr 직접
+      process.stderr.write(
+        `[union-cli warning] httpBodyType=json but value is not valid JSON: "${preview}" — passing as raw string.\n`,
       )
       return value
     }
@@ -129,8 +131,8 @@ export function coerceBodyValue(value: unknown, bodyType?: string): unknown {
       )
     } catch {
       const preview = value.length > 80 ? value.slice(0, 80) + '...' : value
-      logger.warn(
-        `Warning: httpBodyType=json-string-array but value is not valid JSON: "${preview}" — passing as raw string.`,
+      process.stderr.write(
+        `[union-cli warning] httpBodyType=json-string-array but value is not valid JSON: "${preview}" — passing as raw string.\n`,
       )
       return [value]
     }
@@ -760,7 +762,15 @@ export class HTTPProvider implements IProvider {
       return undefined
     }
     if (this.dispatcherCache.has(host)) return this.dispatcherCache.get(host)
-    const dispatcher = await createDispatcher(urlStr, this.proxyConfig)
+    // 우선순위: proxy 가 적용 가능하면 proxy dispatcher.
+    // proxy 가 NO_PROXY 등으로 무시되거나 미설정이면 mTLS 옵션을 확인 → tls dispatcher.
+    let dispatcher = await createDispatcher(urlStr, this.proxyConfig)
+    if (!dispatcher) {
+      const tlsCfg = readTlsConfig(this.config.tls)
+      if (tlsCfg) {
+        dispatcher = await createTlsDispatcher(tlsCfg)
+      }
+    }
     this.dispatcherCache.set(host, dispatcher ?? undefined)
     return dispatcher ?? undefined
   }
@@ -839,11 +849,17 @@ export class HTTPProvider implements IProvider {
             params.set('client_id', auth.clientId)
             params.set('refresh_token', stored.refresh_token)
 
-            const resp = await fetch(resolveEndpointUrl(this.config.baseUrl, auth.tokenEndpoint), {
+            // refresh fetch 도 proxy / mTLS dispatcher 적용 (enterprise / private PKI / corporate proxy 환경에서 동작 보장).
+            const refreshUrl = resolveEndpointUrl(this.config.baseUrl, auth.tokenEndpoint)
+            const refreshDispatcher = await this.getDispatcher(refreshUrl)
+            const refreshInit: RequestInit & {dispatcher?: unknown} = {
               method: 'POST',
               headers: {'Content-Type': 'application/x-www-form-urlencoded'},
               body: params.toString(),
-            })
+              signal: AbortSignal.timeout(this.config.timeout ?? 10000),
+            }
+            if (refreshDispatcher) refreshInit.dispatcher = refreshDispatcher
+            const resp = await fetch(refreshUrl, refreshInit)
             if (resp.ok) {
               const refreshed = await resp.json() as {
                 access_token: string; refresh_token?: string; expires_in?: number;
@@ -976,9 +992,11 @@ export class HTTPProvider implements IProvider {
     // 6. Execute fetch — retry + pagination 통합
     //    retry: 5xx/429/네트워크 에러 + idempotent 메서드일 때 자동 재시도.
     //    pagination: provider.config.pagination 설정 + flags.all=true 일 때 누적.
-    const retryRaw = (this.config as unknown as {retry?: unknown}).retry
-    const retryConfig = normalizeRetryConfig(retryRaw)
-    const timeoutMs = this.config.timeout ?? 30000
+    const retryConfig = normalizeRetryConfig(this.config.retry)
+    // 명령 단위 timeout 이 명시되면 그것을 우선 사용 (cluster manager 의 cluster get / health 처럼
+    // 일부 endpoint 가 더 오래 걸리는 경우, 다른 fast endpoint 의 timeout 을 짧게 유지하면서 override 가능).
+    const cmdTimeout = (httpConfig as {timeout?: number}).timeout
+    const timeoutMs = cmdTimeout ?? this.config.timeout ?? 30000
 
     // init 에는 signal 을 넣지 않는다. AbortSignal 은 한 번 abort 되면 재사용이
     // 불가능하므로, fetchImpl wrapper 에서 매 시도마다 fresh signal 을 주입한다.
@@ -1001,12 +1019,11 @@ export class HTTPProvider implements IProvider {
         },
       })
 
-    const pagRaw = (this.config as unknown as Record<string, unknown>).pagination
     const wantsAll = input.flags.all === true
-    if (pagRaw !== undefined && wantsAll) {
+    if (this.config.pagination !== undefined && wantsAll) {
       let pagConfig: NormalizedPaginationConfig
       try {
-        pagConfig = normalizePaginationConfig(pagRaw)
+        pagConfig = normalizePaginationConfig(this.config.pagination)
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         return {
@@ -1099,16 +1116,21 @@ export class HTTPProvider implements IProvider {
       if (dispatcher) init.dispatcher = dispatcher
       const response = await fetch(this.config.baseUrl, init)
 
-      // 401/403은 "네트워크로는 도달 가능"을 의미하지만 건강한 상태는 아니다.
+      // status<500 은 "네트워크로는 도달 가능". 4xx 는 endpoint 부재/auth 누락 등 client side 문제일 뿐
+      // 백엔드 서비스 자체는 살아있음을 의미하므로 healthy=true 로 분류한다.
+      // (이전에는 response.ok 만 healthy 로 봐서, baseUrl 의 root path 가 404 인 정상 서비스가 'error' 로 나타났다.)
+      const reachable = response.status < 500
       const authProblem = response.status === 401 || response.status === 403
       const message = response.ok
         ? `${this.config.baseUrl} is reachable`
         : authProblem
         ? `${this.config.baseUrl} reachable but authentication required (HTTP ${response.status})`
+        : reachable
+        ? `${this.config.baseUrl} reachable (HTTP ${response.status} on root path)`
         : `${this.config.baseUrl} returned HTTP ${response.status}`
 
       return {
-        healthy: response.ok,
+        healthy: reachable,
         message,
         details: {status: response.status, statusText: response.statusText},
       }

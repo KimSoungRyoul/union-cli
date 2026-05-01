@@ -1,13 +1,88 @@
 import {readFile} from 'node:fs/promises'
+import {dirname, isAbsolute, resolve as resolvePath} from 'node:path'
 import {parse as parseYaml} from 'yaml'
 import Ajv, {type ErrorObject} from 'ajv'
 import {manifestSchema} from './schema.js'
 import {validateManifest, type ValidationWarning} from './validator.js'
 import type {PluginManifest} from '../core/types.js'
 
+// Ajv 가 ESM/CJS dual export 라 환경에 따라 default 위치가 다름. any cast 가 가장 안전.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 const AjvConstructor = (Ajv as any).default || Ajv
 const ajv = new AjvConstructor({allErrors: true, verbose: true})
 const validate = ajv.compile(manifestSchema)
+
+/**
+ * Deep-merge two plain objects. Source 의 값이 우선.
+ * - object × object: 재귀
+ * - array: source 가 통째로 덮어씀 (병합 안 함 — manifest commands 가 실수로 누적되는 걸 방지)
+ * - 그 외: source 우선
+ */
+function deepMerge(target: unknown, source: unknown): unknown {
+  if (
+    target !== null &&
+    typeof target === 'object' &&
+    !Array.isArray(target) &&
+    source !== null &&
+    typeof source === 'object' &&
+    !Array.isArray(source)
+  ) {
+    const out: Record<string, unknown> = {...(target as Record<string, unknown>)}
+    for (const [k, v] of Object.entries(source as Record<string, unknown>)) {
+      out[k] = k in out ? deepMerge(out[k], v) : v
+    }
+    return out
+  }
+  return source !== undefined ? source : target
+}
+
+/**
+ * raw manifest 객체에 `extends: <path>` 가 있으면 부모 파일을 읽어 deep-merge 한다.
+ * cycle detection 으로 무한 재귀 방지.
+ */
+async function expandExtends(
+  raw: Record<string, unknown>,
+  baseDir: string | undefined,
+  visited: Set<string>,
+): Promise<Record<string, unknown>> {
+  const extPath = raw.extends
+  if (typeof extPath !== 'string' || extPath.trim() === '') return raw
+
+  if (!baseDir) {
+    throw new ManifestParseError(
+      `extends: 는 파일 경로 기반 manifest 에서만 사용 가능합니다 (parseManifestString 에서는 불가).`,
+    )
+  }
+  const absParent = isAbsolute(extPath) ? extPath : resolvePath(baseDir, extPath)
+  if (visited.has(absParent)) {
+    throw new ManifestParseError(`extends 사이클 감지: ${[...visited, absParent].join(' → ')}`)
+  }
+  visited.add(absParent)
+
+  const parentContent = await readFile(absParent, 'utf-8')
+  let parentRaw: unknown
+  try {
+    parentRaw = parseYaml(parentContent)
+  } catch (err) {
+    throw new ManifestParseError(
+      `extends 부모 YAML 파싱 실패 (${absParent}): ${err instanceof Error ? err.message : String(err)}`,
+    )
+  }
+  if (!parentRaw || typeof parentRaw !== 'object' || Array.isArray(parentRaw)) {
+    throw new ManifestParseError(`extends 부모가 객체가 아닙니다 (${absParent})`)
+  }
+
+  // 부모도 extends 가능 (재귀)
+  const expandedParent = await expandExtends(
+    parentRaw as Record<string, unknown>,
+    dirname(absParent),
+    visited,
+  )
+
+  // 자식의 extends 키는 결과에서 제거 (스키마 통과를 위해)
+  const {extends: _ignored, ...child} = raw
+  return deepMerge(expandedParent, child) as Record<string, unknown>
+}
 
 /**
  * 파싱 결과 — 검증 통과한 manifest 와 비치명적 경고 목록.
@@ -28,7 +103,22 @@ export interface ParseResult {
  */
 export async function parseManifestFile(filePath: string): Promise<ParseResult> {
   const content = await readFile(filePath, 'utf-8')
-  return parseManifestString(content, filePath)
+  // extends 처리 — 부모 manifest 파일을 deep-merge 후 child 가 override.
+  // raw → expand(extends) → schema validate → semantic validate
+  let raw: unknown
+  try {
+    raw = parseYaml(content)
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error)
+    throw new ManifestParseError(`YAML 파싱 실패 (${filePath}): ${msg}`)
+  }
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    throw new ManifestParseError(`Manifest가 객체가 아닙니다 (${filePath})`)
+  }
+  const visited = new Set<string>([resolvePath(filePath)])
+  const expanded = await expandExtends(raw as Record<string, unknown>, dirname(filePath), visited)
+
+  return parseExpandedManifest(expanded, filePath)
 }
 
 /**
@@ -53,7 +143,18 @@ export function parseManifestString(content: string, source = '<string>'): Parse
   if (!raw || typeof raw !== 'object') {
     throw new ManifestParseError(`Manifest가 객체가 아닙니다 (${source})`)
   }
+  // string 입력에서는 extends 사용 불가 (relative path 의 base 가 없음)
+  if ((raw as Record<string, unknown>).extends !== undefined) {
+    throw new ManifestParseError(
+      `extends: 는 parseManifestFile() 에서만 지원됩니다 (parseManifestString 에서는 base path 가 없음, ${source})`,
+    )
+  }
 
+  return parseExpandedManifest(raw as Record<string, unknown>, source)
+}
+
+/** AJV 검증 + semantic 검증 — extends 가 이미 deep-merge 된 후의 final manifest. */
+function parseExpandedManifest(raw: Record<string, unknown>, source: string): ParseResult {
   const valid = validate(raw)
   if (!valid) {
     const errors = (validate.errors as ErrorObject[] ?? [])
@@ -62,7 +163,7 @@ export function parseManifestString(content: string, source = '<string>'): Parse
     throw new ManifestParseError(`Manifest 스키마 검증 실패 (${source}):\n${errors}`)
   }
 
-  const manifest = raw as PluginManifest
+  const manifest = raw as unknown as PluginManifest
   const warnings = validateManifest(manifest, source)
 
   return {manifest, warnings}

@@ -40,6 +40,13 @@ const messages: Record<Lang, MessageMap> = {
     'didYouMean.heading': '혹시 이 명령을 찾으셨나요?',
     'didYouMean.fallback': "'{cli} --help' 를 실행해 사용 가능한 명령을 확인하세요.",
     'common.unknown': '알 수 없는 오류',
+    'init.alreadyInitialized': '이미 초기화되어 있습니다. --force로 덮어쓸 수 있습니다.',
+    'init.projectDone': '✓ 프로젝트 초기화 완료',
+    'init.nextStep1': '  1. plugins/ 디렉토리에 YAML manifest를 작성하세요',
+    'init.nextStep2': '  2. {cli} build',
+    'init.endpointSaved': '✓ endpointUrl = {url}',
+    'init.endpointPath': '  저장 위치: {path}/config.yaml',
+    'init.endpointHint': '  manifest 의 ${{@endpointUrl}} placeholder 가 이 값을 자동으로 사용합니다.',
   },
   en: {
     'auth.login.success': '{namespace} authenticated',
@@ -62,6 +69,13 @@ const messages: Record<Lang, MessageMap> = {
     'didYouMean.heading': 'Did you mean?',
     'didYouMean.fallback': "Run '{cli} --help' to see available commands.",
     'common.unknown': 'Unknown error',
+    'init.alreadyInitialized': 'Already initialized. Use --force to overwrite.',
+    'init.projectDone': '✓ Project initialized',
+    'init.nextStep1': '  1. Create YAML manifests in plugins/',
+    'init.nextStep2': '  2. {cli} build',
+    'init.endpointSaved': '✓ endpointUrl = {url}',
+    'init.endpointPath': '  Saved to: {path}/config.yaml',
+    'init.endpointHint': '  manifest ${{@endpointUrl}} placeholder will use this value automatically.',
   },
 }
 

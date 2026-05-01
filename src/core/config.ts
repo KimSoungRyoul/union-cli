@@ -1,4 +1,4 @@
-import {mkdirSync, existsSync} from 'node:fs'
+import {mkdirSync, existsSync, readFileSync} from 'node:fs'
 import {readFile, writeFile} from 'node:fs/promises'
 import {homedir} from 'node:os'
 import {join} from 'node:path'
@@ -40,6 +40,23 @@ export class ConfigManager {
 
   async list(): Promise<Record<string, unknown>> {
     return this.readConfig()
+  }
+
+  /**
+   * 동기식 설정 스냅샷 로드.
+   *
+   * oclif init hook 같이 async 진입이 어려운 곳(매니페스트의 `${@key}` placeholder
+   * 치환을 hook 시작 시점에 1회만 하면 충분한 경우)에서 사용한다.
+   *
+   * 파일이 없거나 비어있으면 `{}` 반환. YAML 파싱 실패는 throw.
+   */
+  loadSync(): Record<string, unknown> {
+    const filePath = this.configFilePath
+    if (!existsSync(filePath)) return {}
+    const content = readFileSync(filePath, 'utf-8')
+    if (!content.trim()) return {}
+    const parsed = YAML.parse(content)
+    return (parsed as Record<string, unknown>) ?? {}
   }
 
   private get configFilePath(): string {
