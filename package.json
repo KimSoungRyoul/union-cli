@@ -9,11 +9,32 @@
   },
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./build/builder.js": "./dist/build/builder.js",
+    "./core/pager.js": "./dist/core/pager.js",
+    "./core/output.js": "./dist/core/output.js",
+    "./core/auth-utils.js": "./dist/core/auth-utils.js",
+    "./core/config.js": "./dist/core/config.js",
+    "./core/types.js": {
+      "types": "./dist/core/types.d.ts",
+      "import": "./dist/core/types.js"
+    },
+    "./dist/core/pager.js": "./dist/core/pager.js",
+    "./dist/build/builder.js": "./dist/build/builder.js",
+    "./package.json": "./package.json"
+  },
   "files": [
     "/bin",
     "/dist",
     "/bridge",
-    "/oclif.manifest.json"
+    "/oclif.manifest.json",
+    "LICENSE",
+    "README.md",
+    "README.en.md"
   ],
   "scripts": {
     "build": "tsc -b",
@@ -88,7 +109,11 @@
     "*.ts": "eslint --fix"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/KimSoungRyoul/union-cli.git"
+  }
 }

@@ -59,6 +59,8 @@ export interface HttpCommandConfig {
   method: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
   path: string;
   body?: Record<string, unknown>;
+  /** 명령 단위 timeout (ms). provider.config.timeout 보다 우선. */
+  timeout?: number;
 }
 
 export interface CliCommandConfig {
@@ -146,6 +148,39 @@ export interface HttpProviderConfig {
   auth?: AuthConfig;
   headers?: Record<string, string>;
   timeout?: number;
+  /** Credential store backend. Default 'file'. */
+  credentialStore?: 'file' | 'keychain' | 'env';
+  /** Auto-retry policy for 5xx/429/network errors. Default attempts=1 (no retry). */
+  retry?: {
+    attempts?: number;
+    initialDelayMs?: number;
+    maxDelayMs?: number;
+    retryOn?: number[];
+    respectRetryAfter?: boolean;
+    jitter?: 'full' | 'equal' | 'none';
+    idempotent?: boolean | 'auto';
+  };
+  /** Pagination strategy. `--all` flag enables full-page accumulation. */
+  pagination?: {
+    style: 'cursor' | 'offset' | 'link-header';
+    pageParam?: string;
+    sizeParam?: string;
+    itemsPath?: string;
+    nextPath?: string;
+    maxPages?: number;
+    perPage?: number;
+  };
+  /** mTLS / enterprise / private PKI options. Applied as undici dispatcher on fetch. */
+  tls?: {
+    ca?: string | string[];
+    caFile?: string;
+    cert?: string;
+    certFile?: string;
+    key?: string;
+    keyFile?: string;
+    rejectUnauthorized?: boolean;
+    servername?: string;
+  };
 }
 
 export interface CliProviderConfig {
@@ -211,6 +246,8 @@ export interface SecretRef {
 export interface ManifestCommand {
   id: string;
   description: string;
+  /** 명령 단위 timeout (ms). provider.config.timeout 보다 우선. */
+  timeout?: number;
   http?: {
     method: string;
     path: string;

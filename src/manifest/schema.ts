@@ -3,6 +3,8 @@ export const manifestSchema = {
   required: ['name', 'namespace', 'description', 'provider', 'commands'],
   additionalProperties: false,
   properties: {
+    /** 부모 manifest 경로 (현재 파일 기준 상대). parser 가 deep-merge 후 검증. */
+    extends: {type: 'string', minLength: 1},
     name: {type: 'string', minLength: 1},
     namespace: {type: 'string', pattern: '^[a-z][a-z0-9-]*$'},
     description: {type: 'string'},
@@ -58,6 +60,8 @@ export const manifestSchema = {
         properties: {
           id: {type: 'string', pattern: '^[a-z][a-z0-9-]*(:[a-z][a-z0-9-]*)?$'},
           description: {type: 'string'},
+          /** 명령 단위 timeout (ms). provider.config.timeout 보다 우선. 일부 endpoint 가 더 오래 걸리는 경우 사용. */
+          timeout: {type: 'integer', minimum: 1},
           outputParser: {type: 'string', enum: ['json', 'line', 'lines', 'table', 'csv', 'yaml']},
           flags: {
             type: 'array',

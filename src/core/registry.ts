@@ -108,6 +108,8 @@ export class CommandRegistry {
           method: http.method as HttpCommandConfig['method'],
           path: http.path,
           body: http.body,
+          // 명령 단위 timeout override — provider.config.timeout 보다 우선 (provider.ts 가 사용)
+          ...(cmd.timeout !== undefined ? {timeout: cmd.timeout} : {}),
         } satisfies HttpCommandConfig
       }
 

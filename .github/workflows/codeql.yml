@@ -39,10 +39,12 @@ jobs:
         uses: actions/setup-node@v6
         with:
           node-version: "22"
-          cache: "npm"
+          # cache 옵션 제거 — see ci.yml
 
       - name: Install dependencies
-        run: npm ci
+        # see ci.yml — lock 의 private URL 제거 + .npmrc 로 public registry 강제
+        run: npm ci --no-audit --fetch-timeout=120000 --fetch-retries=3
+        timeout-minutes: 5
         env:
           HUSKY: 0
 

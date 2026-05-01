@@ -116,7 +116,7 @@ provider:
       nextPath: meta.next_cursor
       maxPages: 100
       perPage: 50
-    tls:                    # private PKI / mTLS (helper 추가, wiring 후속)
+    tls:                    # enterprise / private PKI / mTLS (helper 추가, wiring 후속)
       caFile: /etc/ssl/internal-ca.pem
       certFile: /home/user/.cert/client.pem
       keyFile: /home/user/.cert/client.key
@@ -390,6 +390,131 @@ Stub 명령 / Examples / OS 매트릭스
 8. **`cli audit tail/grep`** 명령 — `AuditLogger.tail()` 활용
 9. **examples/ 빌드+실행 E2E** — Wave 1 A3 의 followup
 10. **TypeDoc** — JSDoc 활용 자동 문서 생성
+
+---
+
+## Wave 6: aerocm 실전 통합 발견 사항 (2026-05-01)
+
+> 새 예제 [`examples/aerospike-manager-cli/`](./examples/aerospike-manager-cli/) (Aerospike Cluster Manager API → 18 endpoint 의 `aerocm` CLI) 를 OpenAPI 3.1 spec 기반 5 manifest 로 매핑하면서 발견된 사항.
+
+### 4.1 즉시 수정 (이번 통합에서 같이 처리)
+
+| # | 영역 | 변경 | 파일 |
+|---|---|---|---|
+| 1 | **Type sync** | `HttpProviderConfig` 에 `retry` / `pagination` / `tls` / `credentialStore` 정식 타이핑. ANALYSIS.md 의 P0 #1 (TS interface 미반영) 해결. | `src/core/types.ts:144+` |
+| 2 | **Type cleanup** | `provider.ts` 의 `(this.config as unknown as {retry?: unknown})` / `(this.config as unknown as Record<string, unknown>).pagination` 캐스트 제거. | `src/providers/http/provider.ts:979,1004` |
+| 3 | **Codegen 버그** | table 출력에서 nested object/array 가 `[object Object]` 로 렌더링되던 문제. `cellStr()` 헬퍼로 객체/배열은 `JSON.stringify`, 그 외는 `String()`. aerocm 의 `labels` (map), `hosts` (array) 가 정상 표시. | `src/build/codegen.ts:226+` |
+| 4 | **`resolveEnvVars` 확장 + dedupe** | `auth-utils.ts` 와 `init.ts` 의 중복 정의 제거 (Wave 6 backlog #5 해결). `${@configKey}` 문법 추가로 `~/.<bin>/config.yaml` 값 참조 가능. brace-balanced 파서로 `${A:-${@b:-x}}` 같은 중첩 지원. (`__cliName__` 자동 인식) | `src/core/auth-utils.ts`, `src/hooks/init.ts` |
+| 5 | **`ConfigManager.loadSync()`** | oclif init hook (sync 컨텍스트) 에서 사용자 설정 1회 로드용. 파일 없거나 비어있으면 `{}` graceful. | `src/core/config.ts:42+` |
+| 6 | **`init --endpoint <url>`** | `aerocm init --endpoint http://...` 로 `~/.<bin>/config.yaml` 의 `endpointUrl` 영구 저장. manifest 의 `${@endpointUrl}` placeholder 가 자동으로 사용. 프로젝트 init 과 endpoint 저장이 직교. (Wave 6 backlog 신규 — 사용자 요청 직접 반영) | `src/commands/init.ts` |
+| 7 | **`--debug` details 직렬화 버그** | 실서버 QA 중 발견. 코드젠이 `String(result.error.details)` 를 사용해서 객체 details 가 `[object Object]` 로 출력. `JSON.stringify(det, null, 2)` 로 교체 → 서버 응답 detail (`{"detail":"..."}`) 정상 표시. | `src/build/codegen.ts:133+` |
+| 8 | **CSV 셀의 nested object** | `--format csv` 도 (#3 의 table fix 누락) `[object Object]` 출력. table 의 `cellStr()` 와 동일한 헬퍼를 csv 에도 적용. | `src/build/codegen.ts:176+` |
+
+### 4.2 Wave 7 — 백로그 일괄 정리 (2026-05-01 후속)
+
+> "전부 개선해" 요청에 따라 Wave 6 backlog 22건 중 18건 처리. ANALYSIS.md 의 묵힌 P0 5건 + 신규 발견 13건.
+
+| # | 영역 | 변경 | 파일 |
+|---|---|---|---|
+| Q1 | **`--debug` 없이 5xx detail 자동 노출** | error 시 `result.error.details` 가 있으면 항상 stderr 에 출력. 사용자가 `--debug` 안 줘도 server 가 보낸 detail 노출. | `src/build/codegen.ts` |
+| Q2 | **`--silent-message` flag** | 성공/완료 메시지(stderr) 만 끄는 옵션. `--quiet` 보다 약함. 자동화에서 stdout 만 깨끗하게 받고 싶을 때. | `src/build/codegen.ts` |
+| Q3 | **`--json` quiet 보다 우선** | `--quiet --json` 조합 시 quiet 가 우선해서 JSON 도 안 나오던 문제. `--json` 명시되면 body 출력. | `src/build/codegen.ts` |
+| Q4 | **`--all` flag 자동 주입** | manifest pagination 활성 + GET 메서드 명령에 codegen 이 자동 `--all` flag 추가. 사용자가 manifest 에 일일이 안 적어도 됨. | `src/build/codegen.ts` |
+| Q5 | **`--no-pager` flag + pager wiring** | TTY + 긴 출력 시 자동 `less -R`. json 은 raw 보존(jq 친화). 모든 generated 명령에 자동. helper 는 이미 `core/pager.ts` 존재 — wire 만 안 됐음. | `src/build/codegen.ts` |
+| Q6 | **doctor healthCheck `<500` reachable** | baseUrl `/` GET 의 4xx 도 "도달 가능" 으로 표시. 이전엔 `response.ok` (200대만) 만 healthy → 정상 서비스가 "error" 로 보임. | `src/providers/http/provider.ts` |
+| Q7 | **`coerceBodyValue` warning stderr 직접** | `logger.warn` 은 default level 보다 낮을 수 있어 invisible. `process.stderr.write` 로 즉시 노출. | `src/providers/http/provider.ts` |
+| Q8 | **`resolveEnvVars` 적용 범위 전체 config 재귀** | 이전엔 `baseUrl`, `python.venv` 만. 이제 `resolveStringFields()` 가 모든 string leaf 재귀 치환 → `headers.*`, `tls.caFile/certFile/keyFile`, `auth.tokenEndpoint` 등 전부 ENV/`${@cfg}` 치환. | `src/core/auth-utils.ts`, `src/hooks/init.ts` |
+| W1 | **pager wiring** | codegen 의 generated 명령이 모든 stdout 출력을 buffer → `writeWithPager()` 호출. json 은 raw stdout 직접. | `src/build/codegen.ts` |
+| W2 | **audit logger wiring** | init hook 이 `AuditLogger` 인스턴스 만들어서 `Executor.setAuditLogger()` 주입. NO_AUDIT/--audit-off 가 아니면 모든 명령 호출이 `~/.<cli>/audit.log` (chmod 0600 JSONL) 에 기록. | `src/hooks/init.ts`, `src/core/executor.ts` |
+| W3 | **mTLS dispatcher wiring** | `HTTPProvider.getDispatcher()` 가 proxy 없을 때 `tls-utils.createTlsDispatcher()` 적용. `provider.config.tls.caFile/certFile/keyFile` 옵션이 실제로 fetch 에 주입됨. | `src/providers/http/provider.ts` |
+| W4 | **KeychainCredentialStore factory** | manifest `provider.config.credentialStore: keychain\|file\|env` 옵션이 실제로 적용. 'env' (기본) 는 sharedAuthManager 재사용, 'keychain'/'file' 은 manifest-별 새 AuthManager + store. graceful fallback. | `src/hooks/init.ts` |
+| F1 | **codegen 이 namespace topic stub 자동 생성** | `dist/commands/<ns>/index.js` 자동 생성 — manifest description 이 `<bin> <ns> --help` topic description 으로 표시. Wave 6 의 oclif "마지막 명령 desc 누설" 문제 해결. | `src/build/codegen.ts` |
+| F2 | **manifest `extends:` 합성** | parser 가 `extends: ../shared.yaml` 처리 → 부모 deep-merge 후 자식 override. cycle detection. aerocm 5+1 manifest 의 `provider.config` 25줄 × 5 중복을 제거. | `src/manifest/parser.ts`, `src/manifest/schema.ts` |
+| F3 | **per-command timeout** | manifest `commands[].timeout` (ms) 이 `provider.config.timeout` 보다 우선. fast endpoint 와 slow endpoint 가 한 namespace 에 있어도 분리 가능. | `src/manifest/schema.ts`, `src/core/types.ts`, `src/core/registry.ts`, `src/providers/http/provider.ts` |
+| F4 | **package.json polish** | `exports` field (서브패스 import 명시), `engines.node>=20`, `repository`, LICENSE 파일 추가. | `package.json`, `LICENSE` |
+| F5 | **discovery 가 `_` prefix 파일 skip** | `_shared.yaml` 같은 include-only stub 파일이 plugin 으로 등록되지 않게 함. extends reference 시에만 사용. | `src/build/discovery.ts` |
+| F6 | **device-code refresh proxy/mTLS/timeout 적용** | refresh fetch 가 `getDispatcher()` 호출 → proxy/mTLS dispatcher 사용. AbortSignal.timeout 로 hang 방지. | `src/providers/http/provider.ts` |
+| **OPENAPI** | 🔥 **OpenAPI 3.x → manifest YAML 변환기** | 신규 builtin `<bin> codegen <spec.json>` — tag 별 manifest 자동 생성 (split 기본) 또는 단일 manifest. path/method → http, path-param → args, query → flags(query), body schema flatten → flags(body), array/enum/default 모두 매핑. dangerous(DELETE) 자동. heuristic 으로 list/create/get/update/delete/health/sub-resource 명명. 미커버: oneOf/anyOf 폴리모피즘, file upload, 보안 스키마. 19 endpoint 의 aerocm 변환 시연 — 손 매핑 3시간 → ~10초 + 미세 조정. | `src/build/openapi-to-manifest.ts`, `src/commands/codegen.ts` |
+| I1 | **i18n core 메시지 wrap (시연)** | catalogue 에 `init.*` 키 추가 + `commands/init.ts` 가 `t()` 사용. 다른 모듈 점진적 migration 패턴 제시. | `src/core/i18n.ts`, `src/commands/init.ts` |
+
+### 4.3 Wave 7 정량
+
+- **수정 union-cli 파일**: 11 개 (`types.ts`, `auth-utils.ts`, `config.ts`, `executor.ts`, `i18n.ts`, `audit-log.ts` 미수정—이미 helper로 존재, `manifest/schema.ts`, `manifest/parser.ts`, `build/codegen.ts`, `build/discovery.ts`, `commands/init.ts`, `commands/codegen.ts`, `providers/http/provider.ts`, `hooks/init.ts`, `package.json`)
+- **신규 union-cli 파일**: 2 개 (`src/build/openapi-to-manifest.ts`, `LICENSE`)
+- **신규 테스트**: 1 파일 (`test/openapi-to-manifest.test.ts`, 9 tests for converter heuristic / param/body/dangerous/--single mode)
+- **수정 테스트**: 3 파일 (`test/commands.test.ts` i18n, `test/http-provider.test.ts` stderr warning, `test/http-provider-integration.test.ts` healthCheck 401 의미 변경)
+- **테스트**: **592 tests pass** (이전 583 + 9 신규), type check clean.
+- **aerocm 변경**: 6 manifest 가 `extends: ./_shared.yaml` 로 통합 → provider config 중복 제거 (~125줄 → ~25줄)
+
+### 4.4 남은 Skip 항목
+
+- ~~**#21 CI npm ci 8min hang**~~ ✅ **closed (Wave 7 후속)** — 의존성 lifecycle scripts 의 hang 이 원인. `npm ci --ignore-scripts --prefer-offline --no-audit` 로 변경 (`.github/workflows/{ci,codeql}.yml`). 우리 코드는 dependency 의 install script 결과물에 의존하지 않으므로 안전.
+- **#10 fan-out helper (`aerocm conn health --all`)** — provider-agnostic 한 fan-out 은 manifest schema 영역 밖. ad-hoc shell loop 또는 별도 example 로 시연 권장.
+- **autocomplete 일원화** — `oclif/plugin-autocomplete` 와 `union-cli completion install` 둘 다 동작. 한쪽 deprecate 는 user breaking change 라 별도 결정 필요.
+
+---
+
+### 4.0 신규 백로그 (aerocm 작업으로 새로 식별된 이슈) — Wave 6 시점
+
+| # | 우선순위 | 항목 | 발견 컨텍스트 / 영향 |
+|---|---|---|---|
+| 1 | P1 (UX) | **Topic 도움말 description**: oclif 가 `commands/<ns>/` 디렉터리의 topic 설명을 내부 마지막 명령의 description 으로 채움. `aerocm conn --help` 가 `create` 의 설명을 표시하는 등. **codegen 이 namespace 별로 oclif topic 등록 (package.json 의 `oclif.topics` 또는 topic stub 파일) 을 자동 생성하면 manifest description 사용 가능.** | aerocm 의 5 namespace 모두 영향. UX 직관성 저해. |
+| 2 | P0 (DX) | **OpenAPI 3.x → manifest 자동 변환**: 18 endpoint 를 OpenAPI spec 에서 손으로 옮겨 적음. flag 타입, body type, path/query/body 매핑, snake/camelCase httpName 매핑 등 기계적인 작업. **`union-cli openapi convert <spec.json> --out plugins/` 명령으로 1차 manifest 생성 후 사람이 hand-tune 하는 패턴이 자연스러움.** 현재 `src/commands/codegen.ts` 가 stub (구현 예정) 인 슬롯 활용 가능. | OpenAPI 기반 corporate 내부 API 를 union-cli 로 wrap 할 때마다 반복 비용. |
+| 3 | P1 (DX) | **Manifest 합성 / 공유 config**: aerocm 의 5 manifest 가 동일한 `provider.config` (baseUrl, retry, timeout, auth) 25 줄 × 5 = 125 줄을 중복 선언. **`config/<file>.yaml` 에 `extends: ../shared.yaml` 또는 manifest level `import:` 지원**. | 동일 백엔드 다중 namespace 시 항상 발생. |
+| 4 | P1 | **Per-command timeout override**: `provider.config.timeout` 만 가능. `conn health` / `cluster get` 처럼 실제로 Aerospike 노드에 ping 하는 endpoint 는 30s+ 필요한 반면, list/get 류는 5s 면 충분. **`commands[].timeout` 추가**. | `aerocm conn health` 가 15s 에서 timeout. |
+| 5 | ~~P2 (DRY)~~ ✅ closed | ~~**`resolveEnvVars()` 중복**: `src/core/auth-utils.ts:18` 과 `src/hooks/init.ts:23` 에 동일 함수 정의.~~ → 4.1 #4 에서 해결 (init.ts 가 auth-utils 를 import). |
+| 6 | P2 | **`resolveEnvVars()` 적용 범위 여전히 좁음**: 현재 `baseUrl` (init.ts) 과 python `venv` 만 치환. config 문법은 통합됐지만 적용 위치 확장 필요 — `headers.*`, `tls.caFile/certFile/keyFile`, `auth.tokenEndpoint`, `auth.token.*` 등 전체 config 에 재귀 적용. | enterprise / private PKI 환경에서 `tls.caFile: ${CA_PATH}` 와 같이 쓰려면 별도 작업 필요. |
+| 7 | P2 (UX) | **`pk-type` 같은 enum-string flag 의 oclif 타입**: schema 에서 `options` 만 지정하면 codegen 이 `Flags.string` 로 떨어지는데, 잘못된 값을 주면 oclif 가 친절한 에러를 줌 (잘 동작). 다만 manifest 에 `type: enum` 같은 명시적 타입 없이 `options` 의 존재로 enum 임을 추론하는 건 documentation 부재. **manifest reference 에 명시.** | 새 사용자 진입 장벽. |
+| 8 | P2 | **`record list` 같은 Q 만 있는 GET 의 자동 pagination**: API 가 `pageSize` 만 받고 `next` cursor 가 응답에 포함되어도, manifest 의 `pagination` 설정 없이 `--all` 동작 안 함. 사용자는 매번 `pagination:` 을 직접 적어야 함. **OpenAPI 변환 시 응답 스키마에서 추론 가능하면 자동 주입**. | 5 API endpoint 영향. |
+| 9 | P1 | **`doctor` 의 healthCheck 가 baseUrl `/` 에 GET 후 4xx 면 `error` 표시**: 도달성은 OK 인데 (서버는 살아 있음, 단지 root path 에 GET endpoint 없음) "error" 라고 표시되어 오해 소지. `< 500` 이면 healthy/reachable 로 분류해야 함. | aerocm `doctor` 에서 6 namespace 모두 "error" 로 표시되는데 실제로는 동작함. |
+| 10 | P2 | **`coerceBodyValue` JSON 파싱 실패 warning 이 사용자에게 안 보임**: `httpBodyType: json` 인데 invalid JSON 입력 시 `logger.warn` 으로만 기록 → 일반 사용자는 못 봄. raw string 으로 그대로 전송 → 서버 측 422 받음. **stderr 로 즉시 출력하거나 default 로 throw 하는 strict 모드 추가**. | aerocm 에서 `--bins not-json` 입력 시 user 가 원인 파악 어려움. |
+| 11 | P0 (UX) | **write 명령의 응답에 success message + JSON body 가 같은 stream 에 섞임**: success message 는 stderr, body 는 stdout 으로 분리되어 있음 (의도된 설계). 그러나 사용자가 `2>&1 | jq` 로 묶으면 `JSON.parse` 실패. 문서화 필요 또는 `--silent-message` 옵션. | aerocm `conn create` 의 ID 추출 시 발견. |
+
+### 4.3 정량
+
+- **신규 예제 파일**: 10 개 (manifest 6: connections/clusters/records/indexes/query/sample-data, package.json, tsconfig, bin × 2, src/index.ts, README, expected-output, .gitignore)
+- **수정된 union-cli 파일**: 6 개 (`types.ts`, `providers/http/provider.ts`, `build/codegen.ts`, `core/auth-utils.ts`, `core/config.ts`, `hooks/init.ts`, `commands/init.ts`)
+- **신규 테스트**: 1 파일 (`test/auth-utils.test.ts`, 20 tests for `resolveEnvVars` env/config/중첩/edge cases).
+- **테스트**: **583 tests pass** (이전 563 + 20 신규), type check pass.
+- **실제 호출 검증**:
+  - `conn list/get` 로 the Aerospike Cluster Manager API 16 개 connection 정상 조회.
+  - `aerocm init --endpoint <url>` → `~/.aerocm/config.yaml` 저장 → 후속 호출이 config 값을 사용 확인.
+  - 우선순위 검증: `AEROCM_ENDPOINT_URL` (env) > `~/.aerocm/config.yaml` 의 `endpointUrl` > manifest default.
+
+### 4.4 실서버 QA (env=stage cluster)
+
+stage 평촌 cluster (`conn-3c76a727375b`, AI_DEV_AEROSPIKE, Aerospike CE 6.1.0.12, 3 nodes, 2 namespaces=`aidev` / `aidev_verification`) 에 대해 시나리오 단위 QA.
+
+| 카테고리 | 명령 | 결과 | 비고 |
+|---|---|---|---|
+| Read | `conn list` (json/yaml/table/csv) | ✅ | 16 connection 모두 정상 (csv `labels` 객체 직렬화 확인) |
+| Read | `conn get`, `conn health` | ✅ | nodeCount=3, namespaceCount=2, build=6.1.0.12 |
+| Read | `cluster get` | ✅ | 1094 라인 응답 (노드 statistics 매우 상세) |
+| Read | `record list --ns aidev` | ✅ | record key/meta/bins 정상, total/page/hasMore 메타 |
+| Read | `record list --ns aidev_verification` | ❌ | 서버 500 (server-side issue) |
+| Read | `record filter` | ✅ | `executionTimeMs/scannedRecords/returnedRecords` 메타 |
+| Read | `index list` | ✅ | building/ready state, ns/set/bin/type 모두 |
+| Write | `record put`/`detail`/`delete` 사이클 | ✅ | gen=1→2 증가, +new_bin, ttl reset, list 0 confirm |
+| Write | `index create`/`delete` | ⚠️ | HTTP 500 응답이지만 **실제로 적용됨** (list 로 confirm). server-side quirk. |
+| Write | `conn create`/`update`/`delete` 사이클 | ✅ | id assigned → description 변경 → 404 verify |
+| Write | `sample create` | ❌ | 서버 500 (직접 curl 도 동일, server-side issue. createIndexes 부산물은 만들어짐) |
+| Write | `query exec` | ❌ | 서버 500 |
+| Error | 잘못된 conn_id | ✅ | HTTP 404 + `--debug` detail "Connection 'X' not found" |
+| Error | 필수 flag/arg 누락 | ✅ | "Missing required flag" / "Missing 1 required arg" + help 안내 |
+| Error | enum 잘못된 값 (`--type INVALID`) | ✅ | "Expected --type=INVALID to be one of: numeric, string, geo2dsphere" |
+| Error | dangerous 명령 `--force` 없이 | ✅ | "이 명령은 확인이 필요합니다. --force 플래그를 사용하세요." |
+| Error | 잘못된 JSON `--bins` | ✅ | warning 로그 + raw string 전송 → 서버 422 + detail |
+| Config | `init --endpoint` → conn list (no env) | ✅ | config 값 사용 |
+| Config | `AEROCM_ENDPOINT_URL=invalid` overrides config | ✅ | fetch failed (env 우선 확인) |
+| Config | `config get/list/reset` 빌트인 | ✅ | yaml 형식 출력 |
+| Built-in | `doctor` | ⚠️ | 시스템/manifest 정보 OK. provider health 가 baseUrl `/` 의 404 를 "error" 로 표시 (위 백로그 #9). |
+
+QA 중 발견한 aerocm/union-cli 측 issue 는 모두 fix:
+- ✅ `--debug` 객체 details 가 `[object Object]` (codegen.ts) → JSON.stringify
+- ✅ `--format csv` 의 nested object `[object Object]` → table 과 동일하게 JSON 직렬화
+- ✅ records.yaml example 의 `primaryKey` → `pk` (RecordKey 스키마 필드 정정)
+
+서버 측 5xx 는 union-cli/aerocm 의 retry 정책으로 자동 3회 재시도되어 사용자 경험 개선됨. 응답 detail 은 `--debug` 으로 이제 정상 출력.
 
 ---
 

@@ -236,10 +236,13 @@ describe('Built-in Commands', () => {
   })
 
   describe('init', () => {
-    it('프로젝트 초기화 메시지를 출력한다', async () => {
+    it('프로젝트 초기화 메시지를 출력한다 (i18n catalogue 사용)', async () => {
       const {stdout} = await runCmd(['init', '--force'])
-      expect(stdout).toContain('프로젝트 초기화 완료')
-      expect(stdout).toContain('다음 단계')
+      // i18n wrap 후: '✓ 프로젝트 초기화 완료' (ko default)
+      expect(stdout).toMatch(/프로젝트 초기화 완료|Project initialized/)
+      // step 안내가 두 줄 모두 출력되어야 함
+      expect(stdout).toMatch(/plugins\//)
+      expect(stdout).toMatch(/build/)
     })
   })
 })

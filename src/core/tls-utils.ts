@@ -104,7 +104,7 @@ function readPemFile(path: string, fieldName: string): string {
   } catch (err) {
     const code = (err as NodeJS.ErrnoException)?.code
     const reason = code === 'ENOENT' ? 'not found' : code === 'EACCES' ? 'permission denied' : (err as Error).message
-    throw new Error(`tls.${fieldName}: failed to read "${path}" (${reason})`)
+    throw new Error(`tls.${fieldName}: failed to read "${path}" (${reason})`, {cause: err})
   }
 }
 

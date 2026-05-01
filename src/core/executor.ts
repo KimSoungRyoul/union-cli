@@ -29,6 +29,11 @@ export class Executor {
     this.auditLogger = opts.auditLogger ?? null
   }
 
+  /** init hook 등 후속 시점에서 audit logger 를 주입한다. cliName 이 hook 시점에 결정되기 때문. */
+  setAuditLogger(logger: AuditLogger | null): void {
+    this.auditLogger = logger
+  }
+
   /**
    * namespace 에 해당하는 Provider 인스턴스를 등록한다.
    *

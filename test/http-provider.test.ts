@@ -580,23 +580,23 @@ describe('resolveEndpointUrl', () => {
 // ── coerceBodyValue — JSON 실패 경고 (H5) ──
 
 describe('coerceBodyValue JSON 실패 경고', () => {
-  it('json 파싱 실패 시 logger.warn으로 경고를 출력한다', () => {
-    // logger.warn을 직접 mock해서 console 구현 변경에 영향받지 않게 한다.
-    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+  it('json 파싱 실패 시 stderr 로 경고를 출력한다 (logger.warn 은 default level 보다 낮을 수 있음)', () => {
+    // process.stderr.write 직접 호출로 변경됨 — 사용자에게 즉시 보이도록.
+    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
     coerceBodyValue('not-json', 'json')
-    expect(warnSpy).toHaveBeenCalledOnce()
-    expect(warnSpy.mock.calls[0]?.[0]).toContain('not valid JSON')
-    warnSpy.mockRestore()
+    expect(writeSpy).toHaveBeenCalled()
+    expect(String(writeSpy.mock.calls[0]?.[0])).toContain('not valid JSON')
+    writeSpy.mockRestore()
   })
 
   it('긴 값은 잘라서 경고 메시지에 포함한다', () => {
-    const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {})
+    const writeSpy = vi.spyOn(process.stderr, 'write').mockImplementation(() => true)
     const long = 'x'.repeat(200)
     coerceBodyValue(long, 'json')
-    const msg = warnSpy.mock.calls[0]?.[0] ?? ''
+    const msg = String(writeSpy.mock.calls[0]?.[0] ?? '')
     expect(msg).toContain('...')
     expect(msg.length).toBeLessThan(200)
-    warnSpy.mockRestore()
+    writeSpy.mockRestore()
   })
 })
 
@@ -1589,7 +1589,7 @@ describe('HTTPProvider.execute — pagination 통합', () => {
         res.writeHead(200, {'Content-Type': 'application/json'})
         res.end('{}')
       }
-      const provider = makeProvider({pagination: {style: 'bogus'} as unknown as object})
+      const provider = makeProvider({pagination: {style: 'bogus'}} as unknown as Partial<HttpProviderConfig>)
       const result = await provider.execute(makeSpec(), {args: {}, flags: {all: true}, raw: []})
       expect(result.success).toBe(false)
       expect(result.error?.code).toBe('HTTP_PAGINATION_CONFIG_ERROR')
