@@ -67,7 +67,7 @@
     "@oclif/plugin-help": "^6.2.27",
     "@oclif/plugin-version": "^2.2.41",
     "ajv": "^8.17.1",
-    "undici": "^6.21.0",
+    "undici": "^8.2.0",
     "yaml": "^2.7.1"
   },
   "devDependencies": {
